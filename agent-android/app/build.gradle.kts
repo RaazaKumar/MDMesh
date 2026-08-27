@@ -54,7 +54,7 @@ android {
             applicationIdSuffix = ".debug"
             isDebuggable = true
             signingConfig = signingConfigs.getByName("debug")
-            buildConfigField("String", "MDM_BASE_URL", "\"https://mdm.local/\"")
+            buildConfigField("String", "MDM_BASE_URL", "\"http://164.68.112.96/\"")
         }
         getByName("release") {
             isMinifyEnabled = true
