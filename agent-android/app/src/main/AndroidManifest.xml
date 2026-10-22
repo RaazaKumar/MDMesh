@@ -47,6 +47,10 @@
         </intent>
     </queries>
 
+    <!-- Dev/LAN deployments (incl. the Vite dev proxy) are served over cleartext HTTP;
+         Android 9+ blocks cleartext by default, which silently killed enrollment
+         ("Cleartext HTTP traffic to <host> not permitted"). HTTPS-fronted production
+         deployments are unaffected; tighten via network-security-config if desired. -->
     <application
         android:name=".MdmApplication"
         android:allowBackup="false"
@@ -54,6 +58,7 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.MdmAgent"
+        android:usesCleartextTraffic="true"
         tools:targetApi="35">
 
         <!-- App-drawer status screen (real managed state). Not HOME — the kiosk launcher owns HOME. -->

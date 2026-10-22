@@ -22,6 +22,16 @@ export default defineConfig(({ mode }) => {
           // The server is session-cookie based, so we must forward cookies.
           cookieDomainRewrite: '',
         },
+        // Agent wake channel: the device holds a WebSocket at /agent/ws/{id} for
+        // instant command wake (Sync now, push). Without ws:true the upgrade dies
+        // at the dev server and devices fall back to the 15-min poll floor.
+        // NOTE: keep this prefix exact — a bare '/agent' would also swallow the
+        // /agent.apk download served from public/ and 404 it against Tomcat.
+        '/agent/ws': {
+          target: proxyTarget,
+          changeOrigin: true,
+          ws: true,
+        },
       },
     },
   };

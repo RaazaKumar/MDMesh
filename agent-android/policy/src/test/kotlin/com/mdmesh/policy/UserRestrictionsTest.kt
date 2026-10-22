@@ -33,10 +33,19 @@ class UserRestrictionsTest {
     }
 
     @Test
+    fun `factoryReset maps to the single DISALLOW_FACTORY_RESET restriction`() {
+        assertEquals(
+            setOf(UserRestrictions.DISALLOW_FACTORY_RESET),
+            UserRestrictions.forKey("factoryReset"),
+        )
+    }
+
+    @Test
     fun `restriction string values mirror the android UserManager constants`() {
         assertEquals("no_bluetooth", UserRestrictions.DISALLOW_BLUETOOTH)
         assertEquals("no_usb_file_transfer", UserRestrictions.DISALLOW_USB_FILE_TRANSFER)
         assertEquals("no_physical_media", UserRestrictions.DISALLOW_MOUNT_PHYSICAL_MEDIA)
+        assertEquals("no_factory_reset", UserRestrictions.DISALLOW_FACTORY_RESET)
     }
 
     @Test
@@ -58,6 +67,15 @@ class UserRestrictionsTest {
         assertEquals(21, min)
         // The :policy module's minSdk is 24, so usbStorage is always honourable.
         assertTrue("usbStorage min SDK must be <= module minSdk (24)", min!! <= 24)
+    }
+
+    @Test
+    fun `factoryReset requires API 27 because DISALLOW_FACTORY_RESET is honoured from O_MR1`() {
+        val min = UserRestrictions.minSdkForKey("factoryReset")
+        assertEquals(27, min)
+        // Above the module floor (24), so this key must be gated at runtime rather
+        // than assumed available.
+        assertTrue("factoryReset min SDK must be above the module floor", min!! > 24)
     }
 
     @Test

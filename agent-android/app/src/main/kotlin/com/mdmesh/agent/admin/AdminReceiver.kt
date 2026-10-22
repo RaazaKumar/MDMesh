@@ -11,6 +11,8 @@ import android.os.UserManager
 import com.mdmesh.core.config.ServerConfigStore
 import com.mdmesh.core.store.EnrollTokenStore
 import com.mdmesh.core.sync.CheckInWorker
+import com.mdmesh.policy.reset.FactoryResetPolicyFactory
+import com.mdmesh.policy.wifi.DpmHandle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -31,6 +33,7 @@ class AdminReceiver : DeviceAdminReceiver() {
         setStableOrganizationId(context)
         grantLocationAccess(context)
         protectAgentProcess(context)
+        blockCasualFactoryReset(context)
         CheckInWorker.schedule(context)
     }
 
@@ -41,6 +44,7 @@ class AdminReceiver : DeviceAdminReceiver() {
         setStableOrganizationId(context)
         grantLocationAccess(context)
         protectAgentProcess(context)
+        blockCasualFactoryReset(context)
         // Capture the server URL from the QR bundle BEFORE any check-in, so one prebuilt APK can
         // serve any deployment (it falls back to the baked URL only when absent — dev/ADB).
         ServerConfigStore(context.applicationContext).save(extrasString(intent, EXTRA_SERVER_URL))
@@ -141,6 +145,28 @@ class AdminReceiver : DeviceAdminReceiver() {
                 ?: return
             if (!dpm.isDeviceOwnerApp(context.packageName)) return
             dpm.setUserControlDisabledPackages(componentName(context), listOf(context.packageName))
+        }
+    }
+
+    /**
+     * As Device Owner, close the Settings -> factory-reset path via the
+     * `DISALLOW_FACTORY_RESET` user restriction, API 27+.
+     *
+     * Armed here rather than left to a server `policy.apply` so that protection does not
+     * depend on connectivity: a device that is provisioned and then powered off, kept
+     * offline, or stolen before its first successful check-in would otherwise remain
+     * casually resettable. Idempotent and non-throwing.
+     *
+     * SCOPE: this deters a casual/accidental wipe only. A wipe from the recovery console
+     * (hardware keys) or a firmware reflash happens outside Android and cannot be blocked
+     * by this app on any brand. Reset-surviving enforcement is an OEM/Google-layer
+     * concern — see `docs/anti-theft-lock-plan.md` and ADR 0010.
+     */
+    private fun blockCasualFactoryReset(context: Context) {
+        runCatching {
+            val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+                ?: return
+            FactoryResetPolicyFactory.armAtProvisioning(DpmHandle(dpm, componentName(context)))
         }
     }
 

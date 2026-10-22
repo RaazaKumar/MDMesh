@@ -48,6 +48,8 @@ services:
       SMTP_FROM: ${SMTP_FROM:-mdm@localhost}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    ports:
+      - "8080:8080"
     volumes:
       - mdmeshdata:/opt/mdmesh
 
@@ -72,6 +74,8 @@ services:
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
       ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
     volumes:
       - caddy_data:/data
       - caddy_config:/config
@@ -103,6 +107,8 @@ services:
       COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}
       DB_USER: ${DB_USER:-mdmesh}
       DB_NAME: ${DB_NAME:-mdmesh}
+    ports:
+      - "9000:9000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/project

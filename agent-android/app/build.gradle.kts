@@ -68,7 +68,7 @@ android {
             if (System.getenv("MDM_RELEASE_STORE_FILE") != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
-            buildConfigField("String", "MDM_BASE_URL", "\"https://mdm.example.com/\"")
+            buildConfigField("String", "MDM_BASE_URL", "\"http://164.68.112.96/\"")
         }
     }
 

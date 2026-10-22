@@ -6,7 +6,7 @@ import { mintEnrollToken } from '../api/enroll';
 import { ApiError } from '../api/client';
 import { fmtDateTime } from '../ui/format';
 import { QrCanvas } from '../components/QrCanvas';
-import { buildProvisioningPayload, serverBaseUrl, agentApkUrl, type WifiSecurity } from '../enroll/provisioning';
+import { buildProvisioningPayload, serverBaseUrl, agentApkUrl, serverUrlIsLoopback, type WifiSecurity } from '../enroll/provisioning';
 import { getConfigurations, type Configuration } from '../api/configurations';
 
 const DEFAULT_CONFIG_KEY = 'mdmesh-default-config';
@@ -31,6 +31,7 @@ export function EnrollPage() {
   const [wifiSsid, setWifiSsid] = useState('');
   const [wifiPass, setWifiPass] = useState('');
   const [wifiSec, setWifiSec] = useState<WifiSecurity>('WPA');
+  const [showPayload, setShowPayload] = useState(false);
   const [configs, setConfigs] = useState<Configuration[]>([]);
   const [cfgId, setCfgId] = useState<string>(() => {
     try { return localStorage.getItem(DEFAULT_CONFIG_KEY) ?? ''; } catch { return ''; }
@@ -88,6 +89,25 @@ export function EnrollPage() {
     }
   }
 
+  // The exact JSON encoded into the QR — computed once per render so the canvas, the debug view
+  // and the copy action all show the identical payload.
+  const qrPayload = token
+    ? buildProvisioningPayload(
+        token,
+        wifiSsid.trim() ? { ssid: wifiSsid, password: wifiPass, security: wifiSec } : undefined,
+      )
+    : null;
+
+  async function copyPayload() {
+    if (!qrPayload) return;
+    try {
+      await navigator.clipboard.writeText(qrPayload);
+      toast.push('ok', 'Payload copied', 'QR provisioning JSON copied to clipboard.');
+    } catch {
+      toast.push('err', 'Copy failed', 'Select and copy the payload manually.');
+    }
+  }
+
   return (
     <AppShell title="Enroll">
       <div className="enroll">
@@ -114,14 +134,8 @@ export function EnrollPage() {
             <div className="qr-layout">
               <div>
                 <div className="qr-frame">
-                  {token ? (
-                    <QrCanvas
-                      text={buildProvisioningPayload(
-                        token,
-                        wifiSsid.trim() ? { ssid: wifiSsid, password: wifiPass, security: wifiSec } : undefined,
-                      )}
-                      size={320}
-                    />
+                  {qrPayload ? (
+                    <QrCanvas text={qrPayload} size={320} />
                   ) : (
                     <div className="empty"><span className="spin" /> Preparing…</div>
                   )}
@@ -130,6 +144,28 @@ export function EnrollPage() {
                   Single-use{expiresAt ? ` · expires ${fmtDateTime(expiresAt)}` : ''}
                   {wifiSsid.trim() ? ` · joins Wi-Fi “${wifiSsid.trim()}”` : ''}
                 </div>
+                {/* Temporary debug action: shows the exact JSON encoded in the QR so the
+                    provisioning payload can be verified before scanning. */}
+                {qrPayload && (
+                  <div className="qr-payload-debug">
+                    <button
+                      className="btn btn-sm btn-ghost"
+                      onClick={() => setShowPayload((v) => !v)}
+                    >
+                      {showPayload ? 'Hide QR Payload' : 'View QR Payload'}
+                    </button>
+                    {showPayload && (
+                      <>
+                        <pre className="qr-payload-view">
+                          {JSON.stringify(JSON.parse(qrPayload), null, 2)}
+                        </pre>
+                        <button className="btn btn-sm" onClick={() => void copyPayload()}>
+                          Copy payload
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
                 <details className="wifi-block" open={!!wifiSsid.trim()}>
                   <summary>Pre-connect Wi-Fi during setup (optional)</summary>
                   <div className="wifi-fields">
@@ -181,6 +217,16 @@ export function EnrollPage() {
             <p className="note" style={{ padding: '0 20px 16px' }}>
               Server <span className="mono">{serverBaseUrl()}</span> · agent{' '}
               <span className="mono">{agentApkUrl()}</span>. Host the agent APK at that URL.
+              {serverUrlIsLoopback() && (
+                <>
+                  <br />
+                  ⚠ <span className="mono">{serverBaseUrl()}</span> is localhost — a factory-reset
+                  phone cannot reach it. Set <span className="mono">VITE_PUBLIC_BASE_URL</span> to
+                  an address the phone can reach (e.g.{' '}
+                  <span className="mono">http://&lt;this-PC-LAN-IP&gt;:5173</span>) and restart the
+                  dev server.
+                </>
+              )}
             </p>
           </section>
         )}

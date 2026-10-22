@@ -1,0 +1,49 @@
+
+Achha sawal — aur is repo me iske liye already ek **parked `KnoxAdapter`** hai ([KnoxAdapter.kt](file:///e:/RR%20Finpay%20Complete/AndroidLock/agent-android/oem/src/main/kotlin/com/mdmesh/oem/KnoxAdapter.kt)), jisme decision note kiya gaya tha ki Knox SDK base APK me nahi dalna. Poora implementation plan samjhata hoon:
+
+## Knox Guard actually kya hai
+Samsung ka **free anti-theft service** (Knox Portal ka hissa). Aap device ka **IMEI/MEID/SN portal me register** karte ho → device stolen mark karne par wo **factory reset ke baad bhi Google setup screen par hi lock** ho jata hai, jab tak aap portal me release na karein. Ye **bootloader/Samsung-account level** par hai — Android OS wipe isse hata hi nahi sakta. Yehi "IMEI lock" hai jo normal MDM physically nahi kar sakta.
+
+## Path A — Portal-only (NO code, 90% value)
+Zyadatar enterprises ke liye yahi kaafi hai:
+
+1. **Samsung Knox Portal account** banao: `knox.samsung.com` (free, business verification lagti hai)
+2. Eligibility check: 2016+ ke almost saare Galaxy devices support karte hain; region/carrier variant matter karta hai — Samsung SA se confirm karo (India me generally available hai)
+3. **Asset intake par IMEI capture karo** (box se ya `*#06#` — app se nahi, kyunki Android 10+ block karta hai) → portal me CSV upload
+4. Device stolen/gum hone par: portal me login → device search → **"Report Lost/Stolen"** → wo device ab reset ke baad bhi setup-lock me rahega
+5. Is project me chhota integration: **Devices panel me ek `imei`/`serial` asset field + "Knox Guard" link** — admin wahan se 1-click portal flow kar sake. (Serial already report hota hai aapke agent me — screenshot me `13615455...` dikh raha tha.)
+
+**Limitation:** portal ka koi public API nahi hai — "report stolen" manual hi karna padega.
+
+## Path B — Knox SDK agent integration (full automation)
+Agar aap chahte ho ki **agent khud IMEI read kare** aur server automatically portal-ready inventory banaye — iske liye **Knox Premium (KPE) license** chahiye:
+
+1. **Samsung Authorized MDM Vendor bano** — free program, company verification + aapke **APK signing certificate ko Samsung me register** karna padta hai (isliye `mdmesh-dev.keystore` jaisi fixed signing key critical hai)
+2. Knox SDK (`com.samsung.android.knox.*`) **licensed jar** milta hai — repo me `knox` product flavor banao (KnoxAdapter ke comment me yahi plan likha hai):
+   - Base APK: no Knox code (Play Protect safe, `oem.knox=false`)
+   - `knox` flavor APK: Samsung devices par deploy, `EnterpriseDeviceManager.getIMEINumber()`, Knox-only policies
+3. `KnoxAdapter.isAvailable()` ko reflection probe banao (Knox runtime check), `capability()` me `knox = true` return karo → server already `oem.knox` token flatten karta hai ([AgentCapabilityTokens.java](file:///e:/RR%20Finpay%20Complete/AndroidLock/common/src/main/java/com/hmdm/util/AgentCapabilityTokens.java#L98-L104)), to **capability plumbing ready hai**
+4. Enrollment/check-in me IMEI server ko bhejo → device row par store → lost-device workflow me portal CSV/API payload auto-generate
+5. Bonus jo KPE me khulta hai: Knox-only hardening (recovery wipe restrictions, `setNewMasterClear` policies, secure folder disable, etc.)
+
+## Reality check
+- Knox Guard sirf **Samsung Galaxy** par; Xiaomi/other ke liye wahan ka anti-theft (Mi Account lock) ya FRP hi option hai
+- Ye **anti-theft** hai, MDM nahi — data protection aapke `device.wipe` + passcode + kiosk ke paas hai
+- Path B me license/cert registration me weeks lag sakte hain (Samsung ka process)
+
+## Meri recommendation
+1. **Abhi**: `setMasterClearEnabled(false)` add karo (settings-path wipe band) + passcode enforce — 1 din ka kaam, sab devices par kaam karta hai
+2. **Short-term**: Path A (portal + asset intake CSV) — koi code nahi, asli IMEI-lock mil jata hai
+3. **Long-term**: Path B ka `knox` flavor skeleton bana do (parked adapter revive + reflection probe), jab license mil jaye tab plug-in ho jaye
+
+Bolo to main **(1) masterClear policy** aur **(3) knox flavor skeleton** abhi code me implement kar dun — dono is repo me safe, additive changes hain.
+
+
+Row by row, for this project
+Attack	Possible here?	How / at which layer
+Settings → factory reset	✅ Yes, code only	setMasterClearEnabled(false) + DISALLOW_FACTORY_RESET, in :policy. API 27, your compileSdk 35 / minSdk 24 gate fine.
+Uninstall agent	✅ Already done	Device Owner binding (ADR 0002 cert pinning).
+Remove admin from Settings	✅ Already done	DO admins can't be removed from UI.
+Recovery wipe	⚠️ Cannot be blocked — but can be made pointless	dpm.setFactoryResetProtectionPolicy(admin, FactoryResetProtectionPolicy) — AOSP API 31, device-owner, no Knox SDK needed. After any wipe the setup wizard demands your company Google account. Works on Xiaomi/Oppo/Realme/Pixel.
+Firmware reflash	❌ Not by app code, any brand	Only OEM secure element survives this → Knox Guard (Samsung Knox Vault, server-side, survives Odin flash). Xiaomi's locked bootloader + MiFlash account-authorization raises the cost but is not app-controllable.
+adb remove-active-admin	❌ Not on AOSP	A device owner cannot switch ADB off. Needs Knox (KnoxBasicPolicyManager.setAdbEnabled) — KPE license territory. Mitigation only: enforced passcode + kiosk so Developer Options are unreachable.

@@ -34,12 +34,19 @@ class CheckInWorker @AssistedInject constructor(
     }.fold(
         onSuccess = { Result.success() },
         onFailure = { t ->
-            Log.w(TAG, "check-in failed", t)
+            // TEMP-DIAG(enrollment debugging): attempt count + retry decision in logcat.
+            val terminal = isTerminalEnrollmentRejection(t)
+            Log.w(
+                TAG,
+                "TEMP-DIAG check-in failed (attempt ${runAttemptCount + 1}) -> " +
+                    (if (terminal) "Result.failure (terminal)" else "Result.retry"),
+                t,
+            )
             // Terminal server rejections (burned/expired token, enrollment off) can never succeed
             // by retrying — fail so WorkManager doesn't hammer the enroll endpoint. Everything else
             // (IO/timeout/5xx, and "no enrollment token available" — the token may be persisted
             // milliseconds later by the compliance activity) retries with exponential backoff.
-            if (isTerminalEnrollmentRejection(t)) Result.failure() else Result.retry()
+            if (terminal) Result.failure() else Result.retry()
         },
     )
 

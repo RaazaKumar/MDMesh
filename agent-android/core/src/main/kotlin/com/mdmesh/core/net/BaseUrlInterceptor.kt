@@ -1,5 +1,6 @@
 package com.mdmesh.core.net
 
+import android.util.Log
 import com.mdmesh.core.config.ServerConfigStore
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
@@ -21,6 +22,12 @@ class BaseUrlInterceptor(private val serverConfig: ServerConfigStore) : Intercep
             .host(configured.host)
             .port(configured.port)
             .build()
+        // TEMP-DIAG(enrollment debugging): exact URL leaving the device.
+        Log.i(TAG, "TEMP-DIAG ${req.method} -> $newUrl")
         return chain.proceed(req.newBuilder().url(newUrl).build())
+    }
+
+    private companion object {
+        const val TAG = "MdmNet"
     }
 }

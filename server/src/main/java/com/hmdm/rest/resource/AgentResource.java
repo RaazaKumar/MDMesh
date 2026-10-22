@@ -116,19 +116,28 @@ public class AgentResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response enroll(AgentEnrollRequest request) {
+        // TEMP-DIAG(enrollment debugging): endpoint hit + request summary.
+        logger.info("Agent enroll: endpoint hit (tokenPresent={}, agent={}/{})",
+                request != null && request.getEnrollToken() != null && !request.getEnrollToken().trim().isEmpty(),
+                request == null || request.getAgent() == null ? "n/a" : request.getAgent().getPkg(),
+                request == null || request.getAgent() == null ? "n/a" : request.getAgent().getVersion());
         if (request == null || request.getEnrollToken() == null || request.getEnrollToken().trim().isEmpty()) {
+            logger.info("Agent enroll: validation failed - missing token");
             return Response.ERROR("error.agent.token.invalid");
         }
 
         AgentEnrollmentToken token = tokenDAO.findByToken(request.getEnrollToken());
         if (token == null) {
+            logger.info("Agent enroll: validation failed - unknown token");
             return Response.ERROR("error.agent.token.invalid");
         }
         // Friendly pre-checks for good error messages; the CLAIM below is the actual guard.
         if (token.isUsed()) {
+            logger.info("Agent enroll: validation failed - token already used (tokenId={})", token.getId());
             return Response.ERROR("error.agent.token.used");
         }
         if (token.getExpiresAt() != null && token.getExpiresAt() < System.currentTimeMillis()) {
+            logger.info("Agent enroll: validation failed - token expired (tokenId={})", token.getId());
             return Response.ERROR("error.agent.token.expired");
         }
         // Atomically consume the token BEFORE creating anything: with N concurrent enrolls
@@ -136,8 +145,10 @@ public class AgentResource {
         // the blind mark-used-after-create used here before let every racer mint its own
         // device row, leaving permanent ghost devices.
         if (!tokenDAO.claim(token.getId())) {
+            logger.info("Agent enroll: claim lost - concurrent enroll consumed the token (tokenId={})", token.getId());
             return Response.ERROR("error.agent.token.used");
         }
+        logger.info("Agent enroll: token claimed (tokenId={}), creating device row", token.getId());
 
         String deviceId = UUID.randomUUID().toString();
         Device device = null;
@@ -180,6 +191,7 @@ public class AgentResource {
 
             logger.info("Agent enrolled device {} (configuration {}, {} config apps queued)",
                     deviceId, device.getConfigurationId(), queuedApps);
+            logger.info("Agent enroll: response OK deviceId={}", deviceId);
             return Response.OK(new AgentEnrollResponse(deviceId, configurationName, deviceSecret));
         } finally {
             // A server-side failure (settings rejection, SQL error) must not burn the single-use
@@ -208,12 +220,14 @@ public class AgentResource {
         // One indistinguishable error for unknown-device AND bad-secret: a distinguishable pair
         // is an enumeration oracle for probing valid device numbers on a public endpoint.
         if (device == null) {
+            logger.info("Agent checkin: rejected - unknown device {}", deviceNumber);
             return Response.ERROR("error.agent.unauthorized");
         }
 
         // Authenticate the device by its per-device secret BEFORE any state change.
         // The body-supplied deviceId is untrusted until this passes (prevents IDOR/spoofing).
         if (!authenticate(authorization, deviceNumber)) {
+            logger.info("Agent checkin: rejected - bad/missing device secret for {}", deviceNumber);
             return Response.ERROR("error.agent.unauthorized");
         }
 

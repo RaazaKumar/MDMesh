@@ -159,8 +159,7 @@ public class AuthResource {
 
             if (user.getAuthToken() == null || user.getAuthToken().length() == 0) {
                 user.setAuthToken(PasswordUtil.generateToken());
-                user.setNewPassword(user.getPassword());        // copy value for setUserNewPasswordUnsecure
-                userDAO.setUserNewPasswordUnsecure(user);
+                userDAO.updateUserAuthToken(user);
             }
 
             user.setPassword(null);

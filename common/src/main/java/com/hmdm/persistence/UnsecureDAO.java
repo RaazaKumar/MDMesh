@@ -153,6 +153,10 @@ public class UnsecureDAO {
         userMapper.setNewPassword(user);
     }
 
+    public void updateUserAuthToken(User user) {
+        userMapper.updateAuthToken(user);
+    }
+
     public void setUserLoginFailTime(User user, long ts) {
         user.setLastLoginFail(ts);
         userMapper.setLoginFailTime(user);

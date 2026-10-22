@@ -1,5 +1,6 @@
 package com.mdmesh.core.sync
 
+import android.util.Log
 import com.mdmesh.core.capability.CapabilitySource
 import com.mdmesh.core.net.MdmApi
 import com.mdmesh.core.store.DeviceIdentity
@@ -48,17 +49,29 @@ class EnrollmentManager @Inject constructor(
         val token = tokenProvider.token()?.takeIf { it.isNotBlank() }
             ?: throw EnrollmentException("no enrollment token available")
 
+        // TEMP-DIAG(enrollment debugging)
+        Log.i(TAG, "TEMP-DIAG enrollment started (token present=true)")
+
         // deviceId is unknown pre-enrollment; the server ignores it and issues one.
         val matrix = capabilitySource.matrix(deviceId = "")
-        val response = api.enroll(
-            AgentEnrollRequest(
-                enrollToken = token,
-                agent = matrix.agent,
-                device = matrix.device,
-                capabilities = matrix.capabilities,
-                hardwareId = runCatching { hardwareIdSource.get() }.getOrNull(),
-            ),
-        )
+        val response = try {
+            api.enroll(
+                AgentEnrollRequest(
+                    enrollToken = token,
+                    agent = matrix.agent,
+                    device = matrix.device,
+                    capabilities = matrix.capabilities,
+                    hardwareId = runCatching { hardwareIdSource.get() }.getOrNull(),
+                ),
+            )
+        } catch (t: Throwable) {
+            // TEMP-DIAG(enrollment debugging): surfaces e.g. cleartext/IO failures in logcat.
+            Log.e(TAG, "TEMP-DIAG enrollment request failed: ${t.javaClass.simpleName}: ${t.message}", t)
+            throw t
+        }
+
+        // TEMP-DIAG(enrollment debugging)
+        Log.i(TAG, "TEMP-DIAG enrollment response status=${response.status} message=${response.message} deviceId=${response.data?.deviceId}")
 
         val data = response.data
         if (!response.isOk || data == null) {
@@ -72,6 +85,10 @@ class EnrollmentManager @Inject constructor(
             runCatching { eventSink.record(EventType.ENROLLED) }
         }
         return data.deviceId
+    }
+
+    private companion object {
+        const val TAG = "MdmEnroll"
     }
 }
 
