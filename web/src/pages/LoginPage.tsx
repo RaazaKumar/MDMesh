@@ -25,8 +25,8 @@ export function LoginPage() {
     try {
       u = await signIn(username, password);
     } catch (err) {
-      if (err instanceof ApiError && err.httpStatus === 0) {
-        setError('Cannot reach the server. Check that it is running.');
+      if (err instanceof ApiError && (err.httpStatus === 0 || err.httpStatus >= 500)) {
+        setError(`Cannot reach backend server (${err.httpStatus === 0 ? 'Connection refused' : `HTTP ${err.httpStatus} Bad Gateway`}). Please start the Docker backend.`);
       } else {
         setError('Wrong login or password');
       }
