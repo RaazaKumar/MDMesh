@@ -1,0 +1,13 @@
+{
+  "name": "androidlock-suite",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AndroidLock (MDMesh) runner",
+  "scripts": {
+    "dev": "docker compose up -d && npm run dev --prefix web",
+    "start": "docker compose up -d && npm run dev --prefix web",
+    "stop": "docker compose down",
+    "status": "docker compose ps",
+    "logs": "docker compose logs -f server"
+  }
+}

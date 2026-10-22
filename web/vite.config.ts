@@ -11,7 +11,25 @@ export default defineConfig(({ mode }) => {
   const route = (ws = false) => ({ target, changeOrigin: true, cookieDomainRewrite: '', ws });
 
   return {
-    plugins: [react()],
+    plugins: [
+      react(),
+      {
+        name: 'request-logger',
+        configureServer(server) {
+          server.middlewares.use((req, res, next) => {
+            console.log(`[REQ] ${req.method} ${req.url} from ${req.socket.remoteAddress} | UA: ${req.headers['user-agent']}`);
+            if (req.url && req.url.includes('agent.apk')) {
+              res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+            }
+            const t0 = Date.now();
+            res.on('finish', () => {
+              console.log(`[RES] ${req.method} ${req.url} -> ${res.statusCode} (${Date.now() - t0}ms)`);
+            });
+            next();
+          });
+        },
+      },
+    ],
     build: {
       rolldownOptions: {
         output: {

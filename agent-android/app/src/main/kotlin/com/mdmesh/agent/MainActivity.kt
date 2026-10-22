@@ -46,22 +46,49 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var deviceIdValue: TextView
     private lateinit var kioskValue: TextView
+    private lateinit var serverValue: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleIntent(intent)
         setContentView(buildUi())
-        // Grant our own POST_NOTIFICATIONS as Device Owner BEFORE starting the foreground
-        // service, so the "MDMesh active" notification is visible on Android 13+.
         grantSelfNotifications()
-        // NOTE: we intentionally do NOT pop the battery-optimization request dialog here. As a
-        // foreground-service Device Owner we survive Doze well enough, and that full-screen system
-        // dialog used to sit on top and pause the kiosk launcher, so a kiosk.enter wouldn't take
-        // visible effect until the user dismissed it. There is no public Device-Owner API to grant
-        // the Doze exemption silently, so the safest behaviour is to not interrupt.
-        // Start the near-real-time command channel (foreground poll loop). Starting from the
-        // launcher activity keeps us in the foreground-start allowance on Android 12+.
         ContextCompat.startForegroundService(this, Intent(this, CheckInService::class.java))
         refresh()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+        refresh()
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent == null) return
+        if (intent.getBooleanExtra("com.mdmesh.CLEAR_DEVICE_OWNER", false)) {
+            runCatching {
+                dpmHandle.dpm.clearDeviceOwnerApp(packageName)
+            }
+            refresh()
+            return
+        }
+        val url = intent.getStringExtra("com.mdmesh.SERVER_URL") ?: intent.getStringExtra("SERVER_URL")
+        val token = intent.getStringExtra("com.mdmesh.ENROLL_TOKEN") ?: intent.getStringExtra("ENROLL_TOKEN")
+        if (!url.isNullOrBlank()) {
+            serverConfig.save(url)
+        }
+        if (!token.isNullOrBlank()) {
+            lifecycleScope.launch {
+                com.mdmesh.core.store.EnrollTokenStore(applicationContext).save(token)
+                com.mdmesh.core.sync.CheckInWorker.schedule(applicationContext)
+                ContextCompat.startForegroundService(
+                    this@MainActivity,
+                    Intent(this@MainActivity, CheckInService::class.java),
+                )
+                refresh()
+            }
+        }
     }
 
     /** Self-grant POST_NOTIFICATIONS (Device Owner, API 33+) so our FGS notification shows. */
@@ -87,6 +114,9 @@ class MainActivity : ComponentActivity() {
 
     private fun refresh() {
         kioskValue.text = if (isLocked()) "Locked (kiosk active)" else "Not locked"
+        if (::serverValue.isInitialized) {
+            serverValue.text = serverConfig.baseUrl()
+        }
         lifecycleScope.launch {
             val id = deviceIdStore.current()
             deviceIdValue.text = if (id.isNullOrBlank()) enrollingLabel() else id
@@ -150,7 +180,8 @@ class MainActivity : ComponentActivity() {
         root.addView(spacer())
 
         root.addView(label("SERVER"))
-        root.addView(text(serverConfig.baseUrl(), 13f, MUTED, mono = true))
+        serverValue = text(serverConfig.baseUrl(), 13f, MUTED, mono = true)
+        root.addView(serverValue)
         root.addView(spacer())
 
         root.addView(

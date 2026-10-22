@@ -14,6 +14,7 @@ const env = import.meta.env as Record<string, string | undefined>;
 const AGENT_PACKAGE = env.VITE_AGENT_PACKAGE || 'com.mdmesh.agent.debug';
 const ADMIN_COMPONENT = `${AGENT_PACKAGE}/com.mdmesh.agent.admin.AdminReceiver`;
 const SIGNATURE_CHECKSUM = env.VITE_AGENT_CHECKSUM || 'YMEWhg_-ydciRFgtdOZbQ-W_aPPz7orHKuqfn13Ujaw';
+const PACKAGE_CHECKSUM = env.VITE_AGENT_PACKAGE_CHECKSUM || 'XNkf6o6oCC84r_D8Ky9Fuo2h27VjoklPjvA_A7mtPqs';
 
 /** Server origin embedded in the QR payload. Production: same-origin (Caddy serves the SPA and
  *  proxies the API). Development: override with VITE_PUBLIC_BASE_URL — a factory-reset phone
@@ -96,6 +97,7 @@ export function buildProvisioningPayload(token: string, wifi?: WifiConfig): stri
   const payload: Record<string, unknown> = {
     'android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME': ADMIN_COMPONENT,
     'android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM': SIGNATURE_CHECKSUM,
+    'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_CHECKSUM': PACKAGE_CHECKSUM,
     'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_DOWNLOAD_LOCATION': agentApkUrl(),
     'android.app.extra.PROVISIONING_ADMIN_EXTRAS_BUNDLE': {
       'com.mdmesh.ENROLL_TOKEN': token,

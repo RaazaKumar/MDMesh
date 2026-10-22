@@ -21,12 +21,15 @@ android {
         // Follow-up: make this runtime-configurable (from the provisioning extras).
         val mdmBaseUrl = (project.findProperty("mdmBaseUrl") as String?)
             ?: System.getenv("MDM_BASE_URL")
-            ?: "https://mdm.example.com/"
+            ?: "http://192.168.29.4:5173/"
         buildConfigField("String", "MDM_BASE_URL", "\"$mdmBaseUrl\"")
 
         // Dev/CI fallback enrollment token for ADB enrollment (no QR provisioning
         // bundle). Empty in production builds — real tokens come from the QR bundle.
-        buildConfigField("String", "DEV_ENROLL_TOKEN", "\"\"")
+        val devEnrollToken = (project.findProperty("devEnrollToken") as String?)
+            ?: System.getenv("MDM_DEV_ENROLL_TOKEN")
+            ?: "e9e859c7-4609-4032-b4e5-b6a8b586a1eb"
+        buildConfigField("String", "DEV_ENROLL_TOKEN", "\"$devEnrollToken\"")
     }
 
     buildFeatures {

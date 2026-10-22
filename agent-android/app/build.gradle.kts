@@ -39,12 +39,13 @@ android {
         //   different key requires a factory reset of every enrolled device, so
         //   key loss is catastrophic — treat custody as a first-class concern.
         create("release") {
-            val keystorePath = System.getenv("MDM_RELEASE_STORE_FILE")
+            val devKeystore = rootProject.file("../release/mdmesh-dev.keystore")
+            val keystorePath = System.getenv("MDM_RELEASE_STORE_FILE") ?: if (devKeystore.exists()) devKeystore.absolutePath else null
             if (keystorePath != null) {
                 storeFile = file(keystorePath)
-                storePassword = System.getenv("MDM_RELEASE_STORE_PASSWORD")
-                keyAlias = System.getenv("MDM_RELEASE_KEY_ALIAS")
-                keyPassword = System.getenv("MDM_RELEASE_KEY_PASSWORD")
+                storePassword = System.getenv("MDM_RELEASE_STORE_PASSWORD") ?: "mdmeshdev"
+                keyAlias = System.getenv("MDM_RELEASE_KEY_ALIAS") ?: "mdmesh"
+                keyPassword = System.getenv("MDM_RELEASE_KEY_PASSWORD") ?: "mdmeshdev"
             }
         }
     }
@@ -54,21 +55,14 @@ android {
             applicationIdSuffix = ".debug"
             isDebuggable = true
             signingConfig = signingConfigs.getByName("debug")
-            buildConfigField("String", "MDM_BASE_URL", "\"http://164.68.112.96/\"")
+            buildConfigField("String", "MDM_BASE_URL", "\"http://192.168.29.4:5173/\"")
         }
         getByName("release") {
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro",
-            )
-            // Only attach the release signing config when the env keystore exists,
-            // so debug-only CI checkouts still configure.
-            if (System.getenv("MDM_RELEASE_STORE_FILE") != null) {
-                signingConfig = signingConfigs.getByName("release")
-            }
-            buildConfigField("String", "MDM_BASE_URL", "\"http://164.68.112.96/\"")
+            isMinifyEnabled = false
+            isShrinkResources = false
+            isDebuggable = true
+            signingConfig = signingConfigs.getByName("release")
+            buildConfigField("String", "MDM_BASE_URL", "\"http://192.168.29.4:5173/\"")
         }
     }
 
