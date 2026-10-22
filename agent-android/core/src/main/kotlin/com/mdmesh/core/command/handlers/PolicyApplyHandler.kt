@@ -3,9 +3,10 @@ package com.mdmesh.core.command.handlers
 import com.mdmesh.core.command.CommandHandler
 import com.mdmesh.core.command.CommandResults
 import com.mdmesh.policy.PolicyOutcome
-import com.mdmesh.policy.TogglePolicy
+import com.mdmesh.policy.ResolvedToggles
 import com.mdmesh.proto.CommandEnvelope
 import com.mdmesh.proto.CommandResult
+import com.mdmesh.proto.ConfigOutcome
 import com.mdmesh.proto.ProtocolJson
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -14,13 +15,15 @@ import kotlinx.serialization.Serializable
  * `policy.apply` — applies a single toggle policy to a value. Payload (per
  * `proto/registry.md`): `{ "policy": "wifi", "value": false }`.
  *
- * Routing is fully data-driven: the policy key is looked up in [toggles] (built from the
- * device's supported strategies in the capability-abstraction layer). There is no
+ * Routing is fully data-driven: the policy key is looked up in [toggles] (the device's
+ * supported strategies in the capability-abstraction layer, read per command, never kept:
+ * Device-Owner status flips to true partway through QR provisioning, #76). There is no
  * per-policy `when` — adding a policy means registering its strategy, not editing here.
- * Unknown / unsupported keys degrade to `unsupported`, mirroring the open-registry contract.
+ * Unknown / unsupported keys degrade to `unsupported`, mirroring the open-registry contract;
+ * a key whose support check threw fails the command instead.
  */
 class PolicyApplyHandler(
-    private val toggles: Map<String, TogglePolicy>,
+    private val toggles: () -> ResolvedToggles,
 ) : CommandHandler {
 
     override val type: String = "policy.apply"
@@ -39,13 +42,18 @@ class PolicyApplyHandler(
             ProtocolJson.json.decodeFromJsonElement(Payload.serializer(), payload)
         }.getOrElse { return CommandResults.failed(command, "bad payload: ${it.message}") }
 
-        val toggle = toggles[parsed.policy]
+        val resolved = toggles()
+        // Fail closed: a check that threw fails the command (retryable), it does not make the key unsupported.
+        resolved.errors[parsed.policy]?.let { return CommandResults.failed(command, it.reason) }
+        val toggle = resolved[parsed.policy]
             ?: return CommandResults.unsupported(command, "policy not supported: ${parsed.policy}")
 
         return when (val outcome = toggle.setEnabled(parsed.enabled)) {
             PolicyOutcome.Applied -> CommandResults.done(command)
             PolicyOutcome.Unsupported -> CommandResults.unsupported(command)
             is PolicyOutcome.Failed -> CommandResults.failed(command, outcome.reason)
+            // Not a failure, as in config.apply: skipped on purpose for now (e.g. Wi-Fi radio Off on the only network).
+            is PolicyOutcome.Deferred -> CommandResults.done(command, ConfigOutcome.deferred(outcome.reason))
         }
     }
 }

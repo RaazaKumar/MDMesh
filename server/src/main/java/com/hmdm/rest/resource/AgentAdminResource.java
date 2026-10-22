@@ -23,14 +23,25 @@ package com.hmdm.rest.resource;
 
 import com.hmdm.persistence.AgentCommandDAO;
 import com.hmdm.persistence.AgentEnrollmentTokenDAO;
+import com.hmdm.persistence.DeviceDAO;
 import com.hmdm.persistence.UnsecureDAO;
 import com.hmdm.persistence.domain.AgentCommand;
 import com.hmdm.persistence.domain.AgentEnrollmentToken;
 import com.hmdm.persistence.domain.Device;
+import com.hmdm.persistence.domain.DeviceState;
+import com.hmdm.persistence.domain.DeviceSyncRow;
 import com.hmdm.notification.AgentWakeHub;
 import com.hmdm.rest.json.AgentBulkCommandRequest;
 import com.hmdm.rest.json.Response;
+import com.hmdm.rest.json.agent.CommandHistoryView;
+import com.hmdm.rest.json.agent.ConfigStatusView;
+import com.hmdm.rest.json.agent.ConfigSyncSummary;
+import com.hmdm.rest.resource.support.InstallHashes;
+import com.hmdm.rest.resource.support.ConfigReconciler;
 import com.hmdm.security.SecurityContext;
+import com.hmdm.util.AgentCapabilityTokens;
+import com.hmdm.util.DesiredConfigBuilder;
+import com.hmdm.util.InstallIntegrity;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import org.slf4j.Logger;
@@ -47,7 +58,10 @@ import javax.ws.rs.Produces;
 import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.MediaType;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -55,7 +69,8 @@ import java.util.UUID;
 /**
  * <p>Authenticated admin resource for the from-scratch Android agent v1 protocol: mints enrollment
  * tokens and queues opaque commands. As with {@link AgentResource}, command {@code type}/{@code
- * payload} are never interpreted by the server.</p>
+ * payload} are not interpreted by the server, with one exception: an {@code app.install} is given the
+ * APK's SHA-256 before it is queued (see {@link InstallIntegrity}).</p>
  */
 @Singleton
 @Path("/private/agent/v1")
@@ -70,8 +85,11 @@ public class AgentAdminResource {
     private AgentEnrollmentTokenDAO tokenDAO;
     private AgentCommandDAO commandDAO;
     private UnsecureDAO unsecureDAO;
+    private DeviceDAO deviceDAO;
     private AgentWakeHub wakeHub;
     private com.hmdm.rest.resource.support.ConfigAppInstaller configAppInstaller;
+    private ConfigReconciler configReconciler;
+    private InstallHashes installHashes;
 
     /**
      * <p>A constructor required by Swagger.</p>
@@ -83,13 +101,35 @@ public class AgentAdminResource {
     public AgentAdminResource(AgentEnrollmentTokenDAO tokenDAO,
                               AgentCommandDAO commandDAO,
                               UnsecureDAO unsecureDAO,
+                              DeviceDAO deviceDAO,
                               AgentWakeHub wakeHub,
-                              com.hmdm.rest.resource.support.ConfigAppInstaller configAppInstaller) {
+                              com.hmdm.rest.resource.support.ConfigAppInstaller configAppInstaller,
+                              ConfigReconciler configReconciler,
+                              InstallHashes installHashes) {
         this.tokenDAO = tokenDAO;
         this.commandDAO = commandDAO;
         this.unsecureDAO = unsecureDAO;
+        this.deviceDAO = deviceDAO;
         this.wakeHub = wakeHub;
         this.configAppInstaller = configAppInstaller;
+        this.configReconciler = configReconciler;
+        this.installHashes = installHashes;
+    }
+
+    /**
+     * <p>Every mutation here acts on devices (commands incl. wipe/passcode reset, wake-ups, enrollment
+     * tokens), so it needs {@code edit_devices}, exactly like {@link DeviceResource}. Reads stay open to
+     * any user of the customer. Every device-level route, read or write, is limited to the devices the user
+     * may access ({@link DeviceDAO#isAccessibleToUser}: same customer and, for a user limited to some device
+     * groups, one of those groups).</p>
+     */
+    private static boolean canEditDevices(String action) {
+        if (SecurityContext.get().hasPermission("edit_devices")) {
+            return true;
+        }
+        logger.warn("Permission denied: {} requires edit_devices (user {})", action,
+                SecurityContext.get().getCurrentUser().map(u -> u.getLogin()).orElse("?"));
+        return false;
     }
 
     // =================================================================================================================
@@ -100,6 +140,9 @@ public class AgentAdminResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response mintToken(AgentEnrollmentToken body) {
+        if (!canEditDevices("mint enrollment token")) {
+            return Response.PERMISSION_DENIED();
+        }
         Optional<Integer> customerId = SecurityContext.get().getCurrentCustomerId();
         if (!customerId.isPresent()) {
             return Response.PERMISSION_DENIED();
@@ -112,6 +155,12 @@ public class AgentAdminResource {
         if (configurationId != null) {
             com.hmdm.persistence.domain.Configuration cfg = unsecureDAO.getConfigurationById(configurationId);
             if (cfg == null || cfg.getCustomerId() != customerId.get()) {
+                return Response.ERROR("error.configuration.not.found");
+            }
+            // A user limited to some configurations may bind only one of those.
+            if (!deviceDAO.isConfigurationUsableByUser(configurationId)) {
+                logger.warn("Enrollment token refused: configuration {} is not usable by user {}", configurationId,
+                        SecurityContext.get().getCurrentUser().map(u -> u.getLogin()).orElse("?"));
                 return Response.ERROR("error.configuration.not.found");
             }
         }
@@ -138,6 +187,9 @@ public class AgentAdminResource {
     @Path("/devices/{deviceId}/syncApps")
     @Produces(MediaType.APPLICATION_JSON)
     public Response syncConfigApps(@PathParam("deviceId") String deviceId) {
+        if (!canEditDevices("sync configuration apps")) {
+            return Response.PERMISSION_DENIED();
+        }
         Optional<Integer> customerId = SecurityContext.get().getCurrentCustomerId();
         if (!customerId.isPresent()) {
             return Response.PERMISSION_DENIED();
@@ -146,7 +198,7 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.DEVICE_NOT_FOUND_ERROR();
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
         }
         int queued = configAppInstaller.enqueueConfigApps(device);
@@ -161,8 +213,14 @@ public class AgentAdminResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response queueCommand(@PathParam("deviceId") String deviceId, AgentCommand body) {
+        if (!canEditDevices("queue agent command")) {
+            return Response.PERMISSION_DENIED();
+        }
         if (body == null || body.getType() == null || body.getType().trim().isEmpty()) {
             return Response.ERROR("error.agent.command.invalid");
+        }
+        if (isServerOwned(body.getType())) {
+            return Response.ERROR("error.agent.command.serverOwned");
         }
 
         Optional<Integer> customerId = SecurityContext.get().getCurrentCustomerId();
@@ -174,14 +232,21 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.ERROR("error.agent.device.unknown");
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
+        }
+
+        final String payload;
+        try {
+            payload = payloadToQueue(body.getType(), body.getPayload(), customerId.get());
+        } catch (CommandRejectedException e) {
+            return e.response;
         }
 
         AgentCommand command = new AgentCommand();
         command.setDeviceNumber(deviceId);
         command.setType(body.getType());
-        command.setPayload(body.getPayload());
+        command.setPayload(payload);
         command.setRequiresCapability(body.getRequiresCapability());
         command.setStatus("pending");
         command.setCreatedAt(System.currentTimeMillis());
@@ -191,7 +256,40 @@ public class AgentAdminResource {
         wakeHub.wake(deviceId, "commands");
 
         logger.info("Agent command {} queued for device {}", command.getId(), deviceId);
-        return Response.OK(command);
+        // Payload-free view (same shape as the history): never echo a payload back to the console.
+        return Response.OK(CommandHistoryView.from(command));
+    }
+
+    /** A command that cannot be queued, with the response that says why. */
+    private static final class CommandRejectedException extends Exception {
+        final Response response;
+
+        CommandRejectedException(Response response) {
+            super(response.getMessage());
+            this.response = response;
+        }
+    }
+
+    /** The payload to queue: an {@code app.install} gets its APK's SHA-256 (see {@link InstallIntegrity}). */
+    private String payloadToQueue(String type, String payload, int customerId) throws CommandRejectedException {
+        try {
+            return InstallIntegrity.forCommand(type, payload, installHashes.forCustomer(customerId));
+        } catch (InstallIntegrity.LookupFailedException e) {
+            logger.error("Agent command {}: APK hash lookup failed", type, e);
+            throw new CommandRejectedException(
+                    Response.ERROR("Cannot install: the APK's SHA-256 could not be looked up; try again"));
+        } catch (IllegalArgumentException e) {
+            logger.warn("Agent command {} rejected: {}", type, e.getMessage());
+            throw new CommandRejectedException(Response.ERROR("Cannot install: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * {@code config.apply} is queued only by the server, from the device's configuration (ConfigReconciler), and at most
+     * one is open per device: an admin one is refused before anything is queued. Case-insensitive, like the bulk guard.
+     */
+    private static boolean isServerOwned(String type) {
+        return DesiredConfigBuilder.COMMAND_TYPE.equalsIgnoreCase(type.trim());
     }
 
     /** Command types that must never be issued in bulk (destructive group). Lowercased — matched
@@ -207,6 +305,9 @@ public class AgentAdminResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response queueCommandBulk(AgentBulkCommandRequest req) {
+        if (!canEditDevices("queue bulk agent command")) {
+            return Response.PERMISSION_DENIED();
+        }
         if (req == null || req.getCommand() == null
                 || req.getCommand().getType() == null || req.getCommand().getType().trim().isEmpty()) {
             return Response.ERROR("error.agent.command.invalid");
@@ -218,10 +319,21 @@ public class AgentAdminResource {
         if (BULK_FORBIDDEN_TYPES.contains(type.toLowerCase(java.util.Locale.ROOT))) {
             return Response.ERROR("error.agent.command.bulkForbidden");
         }
+        if (isServerOwned(type)) {
+            return Response.ERROR("error.agent.command.serverOwned");
+        }
 
         Optional<Integer> customerId = SecurityContext.get().getCurrentCustomerId();
         if (!customerId.isPresent()) {
             return Response.PERMISSION_DENIED();
+        }
+
+        // Hashed once for the whole fan-out: every device verifies the same bytes.
+        final String payload;
+        try {
+            payload = payloadToQueue(type, req.getCommand().getPayload(), customerId.get());
+        } catch (CommandRejectedException e) {
+            return e.response;
         }
 
         int queued = 0;
@@ -229,14 +341,14 @@ public class AgentAdminResource {
         for (Integer id : req.getDeviceIds()) {
             if (id == null) { continue; }
             Device device = unsecureDAO.getDeviceById(id);
-            if (device == null || device.getCustomerId() != customerId.get()) {
+            if (device == null || !deviceDAO.isAccessibleToUser(device)) {
                 skipped.add(id);
                 continue;
             }
             AgentCommand command = new AgentCommand();
             command.setDeviceNumber(device.getNumber());
             command.setType(type);
-            command.setPayload(req.getCommand().getPayload());
+            command.setPayload(payload);
             command.setRequiresCapability(req.getCommand().getRequiresCapability());
             command.setStatus("pending");
             command.setCreatedAt(System.currentTimeMillis());
@@ -266,10 +378,71 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.ERROR("error.agent.device.unknown");
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
         }
         return Response.OK(commandDAO.getState(deviceId));
+    }
+
+    // =================================================================================================================
+    @ApiOperation(value = "Device configuration status", notes = "Desired-state revision vs the revision the agent last applied.")
+    @GET
+    @Path("/devices/{deviceId}/configStatus")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getConfigStatus(@PathParam("deviceId") String deviceId) {
+        Optional<Integer> customerId = SecurityContext.get().getCurrentCustomerId();
+        if (!customerId.isPresent()) return Response.PERMISSION_DENIED();
+        Device device = unsecureDAO.getDeviceByNumber(deviceId);
+        if (device == null) return Response.ERROR("error.agent.device.unknown");
+        if (!deviceDAO.isAccessibleToUser(device)) return Response.PERMISSION_DENIED();
+
+        ConfigStatusView v = new ConfigStatusView();
+        v.setConfigurationId(device.getConfigurationId());
+        v.setCurrentRevision(configReconciler.currentRevision(device));
+        DeviceState state = commandDAO.getState(deviceId);
+        if (state != null) { v.setAppliedRevision(state.getAppliedConfigRevision()); v.setAppliedAt(state.getAppliedConfigAt()); }
+        Set<String> tokens = AgentCapabilityTokens.flatten(commandDAO.getDeviceCapabilities(deviceId));
+        boolean supported = AgentCapabilityTokens.isAllowed(DesiredConfigBuilder.CAPABILITY, tokens);
+        v.setSupported(supported);
+        v.setInSync(v.getCurrentRevision() != null && v.getCurrentRevision().equals(v.getAppliedRevision()));
+        v.setLastCommand(ConfigStatusView.LastCommand.from(commandDAO.findLatestOfType(deviceId, DesiredConfigBuilder.COMMAND_TYPE)));
+        return Response.OK(v);
+    }
+
+    // =================================================================================================================
+    @ApiOperation(value = "Configuration sync summary", notes = "Per configuration: how many devices applied its current revision.")
+    @GET
+    @Path("/configurations/syncSummary")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getSyncSummary() {
+        Optional<Integer> customerId = SecurityContext.get().getCurrentCustomerId();
+        if (!customerId.isPresent()) return Response.PERMISSION_DENIED();
+        Map<Integer, String> revisionByConfig = new HashMap<>();
+        Map<Integer, ConfigSyncSummary> out = new LinkedHashMap<>();
+        Set<String> accessible = deviceDAO.getDeviceNumbersAccessibleToUser();
+        for (DeviceSyncRow row : commandDAO.listDevicesForSync(customerId.get())) {
+            if (!accessible.contains(row.getDeviceNumber())) continue;
+            Integer cfgId = row.getConfigurationId();
+            ConfigSyncSummary s = out.computeIfAbsent(cfgId, id -> { ConfigSyncSummary x = new ConfigSyncSummary(); x.setConfigurationId(id); return x; });
+            s.setTotal(s.getTotal() + 1);
+            String current = revisionByConfig.computeIfAbsent(cfgId, id -> {
+                Device probe = new Device(); probe.setConfigurationId(id); probe.setCustomerId(customerId.get());
+                return configReconciler.currentRevision(probe);
+            });
+            Set<String> tokens = AgentCapabilityTokens.flatten(row.getCapabilitiesJson());
+            boolean supported = AgentCapabilityTokens.isAllowed(DesiredConfigBuilder.CAPABILITY, tokens);
+            if (!supported) {
+                s.setUnsupported(s.getUnsupported() + 1);
+            } else if (row.getAppliedConfigRevision() == null) {
+                s.setNeverSeen(s.getNeverSeen() + 1);
+            } else if (row.getAppliedConfigRevision().equals(current)) {
+                s.setInSync(s.getInSync() + 1);
+                if (row.isLastApplyDeferred()) s.setDeferred(s.getDeferred() + 1);
+            } else {
+                s.setOutOfSync(s.getOutOfSync() + 1);
+            }
+        }
+        return Response.OK(new ArrayList<>(out.values()));
     }
 
     // =================================================================================================================
@@ -286,7 +459,7 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.ERROR("error.agent.device.unknown");
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
         }
         com.hmdm.persistence.domain.DeviceState s = commandDAO.getState(deviceId);
@@ -315,7 +488,7 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.ERROR("error.agent.device.unknown");
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
         }
         long sinceMillis = since == null ? 0L : since;
@@ -324,7 +497,8 @@ public class AgentAdminResource {
     }
 
     // =================================================================================================================
-    @ApiOperation(value = "Command history", notes = "Command lifecycle history for a device, newest first.")
+    @ApiOperation(value = "Command history", notes = "Command lifecycle history for a device, newest first. "
+            + "Payloads are never returned (they can embed secrets); app commands carry the package as 'subject'.")
     @GET
     @Path("/devices/{deviceId}/commands")
     @Produces(MediaType.APPLICATION_JSON)
@@ -338,11 +512,11 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.ERROR("error.agent.device.unknown");
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
         }
         long sinceMillis = since == null ? 0L : since;
-        return Response.OK(commandDAO.listHistory(deviceId, sinceMillis, 200));
+        return Response.OK(CommandHistoryView.fromAll(commandDAO.listHistory(deviceId, sinceMillis, 200)));
     }
 
     // =================================================================================================================
@@ -360,7 +534,7 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.ERROR("error.agent.device.unknown");
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
         }
         long sinceMillis = since == null ? 0L : since;
@@ -373,6 +547,9 @@ public class AgentAdminResource {
     @Path("/devices/{deviceId}/sync")
     @Produces(MediaType.APPLICATION_JSON)
     public Response forceSync(@PathParam("deviceId") String deviceId) {
+        if (!canEditDevices("force sync")) {
+            return Response.PERMISSION_DENIED();
+        }
         Optional<Integer> customerId = SecurityContext.get().getCurrentCustomerId();
         if (!customerId.isPresent()) {
             return Response.PERMISSION_DENIED();
@@ -381,7 +558,7 @@ public class AgentAdminResource {
         if (device == null) {
             return Response.ERROR("error.agent.device.unknown");
         }
-        if (device.getCustomerId() != customerId.get()) {
+        if (!deviceDAO.isAccessibleToUser(device)) {
             return Response.PERMISSION_DENIED();
         }
         wakeHub.wake(deviceId, "commands");

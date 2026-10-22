@@ -36,6 +36,8 @@ import javax.ws.rs.core.MediaType;
 
 import javax.inject.Named;
 
+import com.hmdm.event.ConfigurationUpdatedEvent;
+import com.hmdm.event.EventService;
 import com.hmdm.notification.PushService;
 import com.hmdm.persistence.*;
 import com.hmdm.persistence.domain.*;
@@ -47,16 +49,17 @@ import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.ApiParam;
 import io.swagger.annotations.Authorization;
-import org.checkerframework.checker.units.qual.A;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.hmdm.util.FileExistsException;
+import com.hmdm.util.InstallIntegrity;
 
 import java.io.File;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Api(tags = {"Application"}, authorizations = {@Authorization("Bearer Token")})
 @Singleton
@@ -69,6 +72,7 @@ public class ApplicationResource {
     private ApplicationDAO applicationDAO;
     private ConfigurationDAO configurationDAO;
     private PushService pushService;
+    private EventService eventService;
 
     /**
      * <p>A constructor required by Swagger.</p>
@@ -80,10 +84,12 @@ public class ApplicationResource {
     public ApplicationResource(ApplicationDAO applicationDAO,
                                ConfigurationDAO configurationDAO,
                                PushService pushService,
+                               EventService eventService,
                                @Named("files.directory") String filesDirectory) {
         this.applicationDAO = applicationDAO;
         this.configurationDAO = configurationDAO;
         this.pushService = pushService;
+        this.eventService = eventService;
         this.baseDirectory = new File(filesDirectory);
 
         if (!this.baseDirectory.exists()) {
@@ -192,7 +198,10 @@ public class ApplicationResource {
             return Response.PERMISSION_DENIED();
         }
         try {
-            return Response.OK(this.applicationDAO.findById(id));
+            return Response.OK(this.applicationDAO.getApplicationById(id));
+        } catch (SecurityException e) {
+            logger.error("Prohibited to get application #{} by current user", id);
+            return Response.PERMISSION_DENIED();
         } catch (Exception e) {
             logger.error("Failed to retrieve the details for application #{}", id, e);
             return Response.INTERNAL_ERROR();
@@ -214,6 +223,10 @@ public class ApplicationResource {
                     SecurityContext.get().getCurrentUserName());
             return Response.PERMISSION_DENIED();
         }
+        if (application.getSha256() != null && !application.getSha256().trim().isEmpty()
+                && InstallIntegrity.hexOnly(application.getSha256()) == null) {
+            return Response.ERROR("The APK's SHA-256 must be 64 hex characters");
+        }
         try {
             if (application.getId() == null) {
                 final int appId = this.applicationDAO.insertApplication(application);
@@ -222,10 +235,16 @@ public class ApplicationResource {
             } else {
                 this.applicationDAO.updateApplication(application);
                 if (application.getUrl() != null && application.getLatestVersion() != null && !application.isSplit()) {
-                    ApplicationVersion version = applicationDAO.findApplicationVersionById(application.getLatestVersion());
+                    // The stored latest version of this application, not a version id taken from the request
+                    final Integer latestVersionId = applicationDAO.findById(application.getId()).getLatestVersion();
+                    ApplicationVersion version = latestVersionId == null ? null : applicationDAO.findApplicationVersionById(latestVersionId);
                     if (version != null) {
                         version.setUrl(application.getUrl());
                         applicationDAO.updateApplicationVersion(version);
+                        String apkHash = InstallIntegrity.toApkHash(application.getSha256());
+                        if (apkHash != null) {
+                            applicationDAO.saveApkHash(version.getId(), apkHash);
+                        }
                         logger.info("Application " + application.getPkg() + " updated to version " + version.getVersion() +
                                 ", user " + SecurityContext.get().getCurrentUserName());
                     }
@@ -274,7 +293,9 @@ public class ApplicationResource {
                 // TODO : ISV : Handle the scenario for inserting new version for the same package here
                 this.applicationDAO.updateWebApplication(application);
                 if (application.getUrl() != null && application.getLatestVersion() != null) {
-                    ApplicationVersion version = applicationDAO.findApplicationVersionById(application.getLatestVersion());
+                    // The stored latest version of this application, not a version id taken from the request
+                    final Integer latestVersionId = applicationDAO.findById(application.getId()).getLatestVersion();
+                    ApplicationVersion version = latestVersionId == null ? null : applicationDAO.findApplicationVersionById(latestVersionId);
                     if (version != null) {
                         version.setUrl(application.getUrl());
                         applicationDAO.updateApplicationVersion(version);
@@ -393,6 +414,41 @@ public class ApplicationResource {
 
     // =================================================================================================================
     @ApiOperation(
+            value = "Set the APK SHA-256 of an application version",
+            notes = "Stores the hex SHA-256 of the version's APK (an APK this server does not host needs one before "
+                    + "devices install it). Body: {\"sha256\": \"<64 hex>\"}."
+    )
+    @PUT
+    @Path("/versions/{id}/sha256")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response setApplicationVersionSha256(@PathParam("id") @ApiParam("Application Version ID") Integer id,
+                                                Map<String, String> body) {
+        if (!SecurityContext.get().hasPermission("edit_application_versions")) {
+            logger.error("Unauthorized attempt to set an APK hash by user " + SecurityContext.get().getCurrentUserName());
+            return Response.PERMISSION_DENIED();
+        }
+        String sha = body == null ? null : body.get("sha256");
+        if (InstallIntegrity.hexOnly(sha) == null) {
+            return Response.ERROR("The APK's SHA-256 must be 64 hex characters");
+        }
+        try {
+            if (!this.applicationDAO.saveApkHash(id, InstallIntegrity.toApkHash(sha))) {
+                return Response.ERROR("No such application version");
+            }
+            logger.info("APK SHA-256 of application version #{} set by user {}", id,
+                    SecurityContext.get().getCurrentUserName());
+            return Response.OK();
+        } catch (SecurityException e) {
+            return Response.PERMISSION_DENIED();
+        } catch (Exception e) {
+            logger.error("Failed to set the APK SHA-256 of application version #{}", id, e);
+            return Response.INTERNAL_ERROR();
+        }
+    }
+
+    // =================================================================================================================
+    @ApiOperation(
             value = "Delete application version",
             notes = "Delete an existing application version"
     )
@@ -500,25 +556,27 @@ public class ApplicationResource {
             if (!user.isAllConfigAvailable()) {
                 // Remove all configurations unavailable to user
                 request.getConfigurations().removeIf(c ->
-                        user.getConfigurations().stream().filter(uc -> uc.getId() == c.getConfigurationId()).findFirst() == null);
+                        user.getConfigurations().stream().noneMatch(uc -> uc.getId() == c.getConfigurationId()));
             }
-            // Avoid access to objects of another customer
+            // Avoid access to objects of another customer (common applications may be linked by any customer).
+            // The DAO enforces the same rules against the persisted rows; this only drops foreign links early.
             request.getConfigurations().removeIf(c -> {
-                // findById will raise a SecurityException if attempting to access an object of another customer
-                // So actually this code is a bit redundant, but it guards access to own objects anyway
+                // getConfigurationById will raise a SecurityException if attempting to access an object of another customer
                 Application application = applicationDAO.findById(c.getApplicationId());
                 Configuration configuration = configurationDAO.getConfigurationById(c.getConfigurationId());
-                return application.getCustomerId() != user.getCustomerId() ||
+                return application == null ||
+                       (!application.isCommon() && application.getCustomerId() != user.getCustomerId()) ||
                        configuration.getCustomerId() != user.getCustomerId();
             });
             logger.info("Application configurations updated by user " + SecurityContext.get().getCurrentUserName());
-            this.applicationDAO.updateApplicationConfigurations(request);
+            Set<Integer> changed = this.applicationDAO.updateApplicationConfigurations(request);
 
             for (ApplicationConfigurationLink configurationLink : request.getConfigurations()) {
                 if (configurationLink.isNotify()) {
                     this.pushService.notifyDevicesOnUpdate(configurationLink.getConfigurationId());
                 }
             }
+            configurationsUpdated(changed);
 
             return Response.OK();
         } catch (Exception e) {
@@ -547,21 +605,32 @@ public class ApplicationResource {
             if (!user.isAllConfigAvailable()) {
                 // Remove all configurations unavailable to user
                 request.getConfigurations().removeIf(c ->
-                        user.getConfigurations().stream().filter(uc -> uc.getId() == c.getConfigurationId()).findFirst() == null);
+                        user.getConfigurations().stream().noneMatch(uc -> uc.getId() == c.getConfigurationId()));
             }
             logger.info("Application version configurations updated by user " +
                     SecurityContext.get().getCurrentUserName());
-            this.applicationDAO.updateApplicationVersionConfigurations(request, user);
+            Set<Integer> changed = this.applicationDAO.updateApplicationVersionConfigurations(request, user);
             for (ApplicationVersionConfigurationLink configurationLink : request.getConfigurations()) {
                 if (configurationLink.isNotify()) {
                     this.pushService.notifyDevicesOnUpdate(configurationLink.getConfigurationId());
                 }
             }
+            configurationsUpdated(changed);
 
             return Response.OK();
         } catch (Exception e) {
             logger.error("Unexpected error when updating application configurations", e);
             return Response.INTERNAL_ERROR();
+        }
+    }
+
+    /**
+     * Link edits changed these configurations: tell their devices as a configuration save does (MDMesh agents are
+     * woken to check in, after AgentConfigUpdatedListener's commit delay). Fired once the save has committed.
+     */
+    private void configurationsUpdated(Set<Integer> configurationIds) {
+        for (Integer id : configurationIds) {
+            this.eventService.fireEvent(new ConfigurationUpdatedEvent(id));
         }
     }
 

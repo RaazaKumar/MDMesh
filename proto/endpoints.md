@@ -14,8 +14,9 @@ Both sides flatten a `CapabilityMatrix.capabilities` object into a flat `Set<Str
 
 | Source | Token form | Example |
 |--------|-----------|---------|
-| `policy[]` entry | `policy.<key>` | `policy.wifi`, `policy.camera`, `policy.kioskLockTask` |
+| `policy[]` entry | `policy.<key>` | `policy.wifi`, `policy.camera`, `policy.factoryReset` |
 | `appManagement[]` entry | `app.<key>` | `app.silentInstall` |
+| `device[]` entry | `device.<key>` | `device.lock`, `device.wipe`, `device.configApply` |
 | `remoteControl.tier` (if not `none`) | `remote.<tier>` | `remote.view`, `remote.control` |
 | `oem.knox` (if true) | `oem.knox` | `oem.knox` |
 
@@ -66,8 +67,23 @@ Response `data` (`agent-checkin-response.schema.json`):
 { "protocolVersion": "1.0", "commands": [ { "protocolVersion":"1.0","commandId":"...","type":"policy.apply","issuedAt":"...","requiresCapability":"policy.wifi","payload":{"policy":"wifi","value":false} } ] }
 ```
 
+`installIntegrity: "required"` (protocol 1.3) says every `app.install` this server queues carries the APK's
+`sha256`; the agent keeps the last value and, while it is set, refuses an `app.install` without one. An older server
+omits it and the agent installs as before.
+
 `results` acks let the server mark queued commands `done`/`failed`/`unsupported`. `capabilities`
 is re-posted every check-in (cheap, keeps the token set fresh as the OS/agent changes).
+
+`resultsAccepted` (protocol 1.3) is how many of the request's `results`, counted from the first, the server took (it
+takes at most 1000 per check-in). The agent drops those and keeps the rest for its next check-in. Absent (an older
+server) means all of them were taken.
+
+An agent runs its commands inside a check-in, one check-in at a time, and reports each result in a later check-in. So
+when a check-in arrives without the result of a `config.apply` delivered before it, and the device's applied revision
+differs from the current one, the server takes it that the agent stopped mid-apply (Android ended it, a restart, an
+update): it records that `config.apply` as `expired` and sends the current configuration in the same response. A
+result that arrives later still counts. Agents must keep this property: never send a check-in while a delivered
+`config.apply` is still running.
 
 ## Auth posture (v1)
 

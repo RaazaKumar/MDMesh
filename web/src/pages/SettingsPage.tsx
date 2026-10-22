@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { AppShell } from '../ui/AppShell';
 import { useAuth } from '../auth/AuthContext';
 import { useTheme } from '../ui/theme';
@@ -228,8 +228,9 @@ export function SettingsPage() {
                   </div>
                   {upd.applySupported === false && (
                     <p className="au-note">
-                      This deployment was installed from source — update the server/console with
-                      <span className="mono"> git pull && sudo ./install/install-native.sh</span>.
+                      This deployment was installed from source — update the server/console with the
+                      command for your install. Docker (from source): <span className="mono">git pull && ./setup.sh</span> · Native:{' '}
+                      <span className="mono">git pull && sudo ./setup.sh --native</span>
                     </p>
                   )}
                   {!upd.verified && (

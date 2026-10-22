@@ -1,0 +1,168 @@
+# T0 fast gate: every PR push and push to main, path-filtered, under 5 minutes.
+# One job per old workflow (server.yml, web.yml, agent.yml), run as a matrix entry gated
+# by changed-paths so an untouched subtree costs nothing. Steps within each entry
+# reproduce that old workflow's steps and commands exactly; project-specific comments
+# from the old workflows are copied along with the commands they explain. A fourth entry,
+# supervisor, builds the updater/recovery supervisor image and runs its unit tests plus
+# scripts/supervisor-smoke.sh against it (the compose-shaped start guard for #27). A fifth, edge,
+# runs scripts/edge-check.sh: the Caddyfile in every hosting mode under the web image's own caddy, its /healthz
+# routes against stub upstreams, plus `docker compose config` for every compose file/overlay/profile combination; then
+# it builds the web image (docker/web.Dockerfile), which nothing else builds before a release. When the installers change,
+# the edge entry also checks that quickstart.sh's inline BASE_URL check is still install/lib/url.sh's, byte for byte.
+name: t0-fast
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  paths:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      matched: ${{ steps.cp.outputs.matched }}
+      all: ${{ steps.cp.outputs.all }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - id: cp
+        uses: ./.github/actions/ci-kit/changed-paths
+        with:
+          filters: |
+            server: pom.xml, common/**, jwt/**, notification/**, plugins/**, server/**
+            web: web/**
+            agent: agent-android/**, proto/**
+            supervisor: supervisor/**, docker/supervisor.Dockerfile, release/minisign.pub, scripts/supervisor-smoke.sh, .dockerignore
+            # Listed explicitly: the kit's fail-closed **/Dockerfile* does not match docker/web.Dockerfile. web/**,
+            # web-entrypoint.sh, edge-peers.sh and .dockerignore are the web image build's inputs.
+            edge: docker/Caddyfile, docker/web.Dockerfile, docker/web-entrypoint.sh, docker/edge-peers.sh, web/**, .dockerignore, docker-compose*.yml, docker/dev.env, scripts/edge-check.sh
+            # The installer scripts. Only the edge entry's cheap quickstart.sh copy check runs on these, not its image work.
+            installers: quickstart.sh, setup.sh, install/**
+
+  build:
+    name: ${{ matrix.name }}
+    needs: paths
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    # The supervisor and edge entries' image tags, each defined once for its build step and its cleanup step. Per run:
+    # on a daemon shared by several runners (vars.CI_RUNNER) a fixed tag lets concurrent runs retag each other's image,
+    # so a run could smoke another PR's build.
+    env:
+      SUP_IMG: mdmesh-supervisor:ci-${{ github.run_id }}-${{ github.run_attempt }}
+      WEB_IMG: mdmesh-web:ci-${{ github.run_id }}-${{ github.run_attempt }}
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [server, web, agent, supervisor, edge]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # --- server (from server.yml) ---
+      - if: matrix.name == 'server' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).server)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad  # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - if: matrix.name == 'server' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).server)
+        name: Provide build.properties
+        run: cp server/build.properties.example server/build.properties
+      - if: matrix.name == 'server' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).server)
+        name: Contract + unit tests (DB-free)
+        # :common tests (incl. AgentV1ContractTest — the backward-compat gate) and the DB-free :server tests need no
+        # database. The package step skips tests (they just ran); DB-backed behaviour is T1's (t1-e2e.yml).
+        run: mvn -B -pl server -am test
+      - if: matrix.name == 'server' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).server)
+        name: Build WAR
+        run: mvn -B -DskipTests package
+      - if: matrix.name == 'server' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).server)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: launcher-war
+          path: server/target/launcher.war
+          if-no-files-found: error
+
+      # --- web (from web.yml) ---
+      - if: matrix.name == 'web' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).web)
+        uses: ./.github/actions/ci-kit/setup-npm
+        with:
+          working-directory: web
+      - if: matrix.name == 'web' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).web)
+        working-directory: web
+        run: npm run build
+
+      # --- agent (from agent.yml) ---
+      - if: matrix.name == 'agent' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).agent)
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd  # v4.0.4
+        with:
+          # Default is "tools platform-tools"; Google removed the legacy "tools" package from the
+          # SDK repository (Sept 2026) so sdkmanager exits 1. AGP auto-provisions platforms/build-tools.
+          packages: platform-tools
+      - if: matrix.name == 'agent' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).agent)
+        uses: ./.github/actions/ci-kit/setup-gradle
+        with:
+          java-version: "17"
+      - if: matrix.name == 'agent' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).agent)
+        name: Detekt + assemble + lint + unit tests
+        # The repo now carries a committed Gradle wrapper, and the kit's setup-gradle action is
+        # built around wrapper caches rather than installing a standalone `gradle` on PATH (the
+        # old workflow's approach, from when no wrapper was committed), so this uses ./gradlew.
+        # detekt runs in the same Gradle invocation (no second JVM start; ~5 s on the whole agent);
+        # pre-existing findings are in agent-android/config/detekt/baseline.xml, new code must be clean.
+        working-directory: agent-android
+        # :proto is a plain JVM module, so testDebugUnitTest skips it; run its tests by name (release.yml does too).
+        run: ./gradlew --no-daemon detekt assembleDebug lintDebug testDebugUnitTest :proto:test
+
+      # --- supervisor (#27): build the image, run its unit tests on the shipped Node, then run it the
+      # way docker-compose runs it (working_dir /project + project mounted) and probe its routes. ---
+      - if: matrix.name == 'supervisor' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).supervisor)
+        name: Build image + unit tests + compose-shaped smoke
+        run: |
+          docker build -f docker/supervisor.Dockerfile -t "$SUP_IMG" .
+          docker run --rm -w /app "$SUP_IMG" node --test test.js
+          scripts/supervisor-smoke.sh "$SUP_IMG"
+      - if: always() && matrix.name == 'supervisor'
+        name: Remove the per-run supervisor image
+        run: docker rmi -f "$SUP_IMG" >/dev/null 2>&1 || true
+
+      # --- edge: the Cloudflare-mode Caddyfile break (empty ACME_EMAIL) shipped because nothing parsed it. Validates
+      # docker/Caddyfile in every hosting mode with the caddy image web.Dockerfile builds FROM, and every compose combo;
+      # then checks /healthz and /healthz/supervisor report their upstream's health (503, never the SPA's 200). ---
+      # quickstart.sh carries a verbatim copy of install/lib/url.sh's functions (the region between the ">>> url.sh
+      # functions" and "<<< url.sh functions" markers): it runs from main but fetches install/lib from the release it
+      # installs, which may predate url.sh (see quickstart.sh). Fail when the copies differ.
+      - if: matrix.name == 'edge' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).installers)
+        name: quickstart.sh's BASE_URL check matches install/lib/url.sh
+        run: |
+          fn() { sed -n '/^# >>> url.sh functions /,/^# <<< url.sh functions <<<$/p' "$1"; }
+          lib=$(fn install/lib/url.sh); qs=$(fn quickstart.sh)
+          if [ -z "$lib" ] || [ "$lib" != "$qs" ]; then
+            echo "::error file=quickstart.sh::the url.sh functions in quickstart.sh are not a verbatim copy of install/lib/url.sh's (or one is missing). Copy the region between the markers into quickstart.sh."
+            diff -u <(printf '%s\n' "$lib") <(printf '%s\n' "$qs") || true
+            exit 1
+          fi
+          echo "quickstart.sh's url.sh functions are identical to install/lib/url.sh's"
+      - if: matrix.name == 'edge' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).edge)
+        name: Caddyfile modes + compose overlays
+        run: scripts/edge-check.sh
+      # The web image release.yml publishes: the SPA build, the pinned caddy and web-entrypoint.sh, from the build context
+      # .dockerignore shapes. A Caddy pin, a Dockerfile or a .dockerignore change that breaks it would otherwise first
+      # fail in a release.
+      - if: matrix.name == 'edge' && (needs.paths.outputs.all == 'true' || fromJSON(needs.paths.outputs.matched).edge)
+        name: Build the web image
+        run: docker build -f docker/web.Dockerfile -t "$WEB_IMG" .
+      - if: always() && matrix.name == 'edge'
+        name: Remove the per-run web image
+        run: docker rmi -f "$WEB_IMG" >/dev/null 2>&1 || true
+
+  # NOTE: an emulator-based instrumentation matrix (the "version-treadmill guard" — boot the agent
+  # across API levels so SDK_INT-gated breakage surfaces in CI) is deferred until real instrumented
+  # (androidTest) tests exist, per agent.yml. Nothing to migrate.

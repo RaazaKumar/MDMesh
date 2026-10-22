@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { scanApps, fetchIcons, getLatestScan, type AppInfo } from '../api/deviceApps';
 import { listApplications, appCategory, type Application } from '../api/applications';
+import { getConfiguration, type Configuration } from '../api/configurations';
 import { queueCommand } from '../api/commands';
 import { useToast } from '../ui/toast';
+import { CONFIG_FIELDS } from '../data/configFields';
 
-type Device = { number: string };
+type Device = { number: string; configurationId?: number; description?: string };
 type Mode = 'launcher' | 'single';
 type Source = 'library' | 'device';
 
@@ -15,15 +17,39 @@ export type KioskChoice = {
   password?: string;
 };
 
+export type KioskTheme = {
+  backgroundColor?: string;
+  textColor?: string;
+  iconSize?: string;
+};
+
 /** Build the `kiosk.enter` payload (device-independent). Mirrors the single-device apply() exactly. */
-export function buildKioskPayload(c: KioskChoice): object {
+export function buildKioskPayload(c: KioskChoice, theme?: KioskTheme): object {
+  const common = {
+    exitMode: c.exitMode,
+    password: c.password || undefined,
+    features: { home: true, notifications: true },
+    // A direct kiosk action changes the allowed apps, not the configuration's appearance.
+    // Include the assigned configuration theme so it does not revert to launcher defaults.
+    ...(theme ? { theme } : {}),
+  };
   return c.mode === 'single'
     ? { mode: 'single', pinPackage: c.packages[0], allowedPackages: c.packages,
-        exitMode: c.exitMode, password: c.password || undefined,
-        features: { home: true, notifications: true } }
+        ...common }
     : { mode: 'launcher', allowedPackages: c.packages,
-        exitMode: c.exitMode, password: c.password || undefined,
-        features: { home: true, notifications: true } };
+        ...common };
+}
+
+export function kioskTheme(configuration: Configuration | undefined): KioskTheme | undefined {
+  if (!configuration) return undefined;
+  const value = (key: 'backgroundColor' | 'textColor' | 'iconSize') =>
+    typeof configuration[key] === 'string' ? configuration[key] as string : undefined;
+  const theme = {
+    backgroundColor: value('backgroundColor'),
+    textColor: value('textColor'),
+    iconSize: value('iconSize'),
+  };
+  return Object.values(theme).some((v) => v !== undefined) ? theme : undefined;
 }
 
 /** A row in either source, normalised so the list renders the same way. */
@@ -34,6 +60,9 @@ interface PickItem {
   system: boolean;
   badge?: string;
 }
+
+/** The configuration's own help for the exit PIN, so the modals say the same: an empty PIN means no exit on the device. */
+export const EXIT_PIN_HELP = CONFIG_FIELDS.find((f) => f.key === 'password')?.help;
 
 const iconKey = (pkg: string, v?: number) => `mdm.icon.${pkg}@${v ?? 0}`;
 function cachedIcon(pkg: string, v?: number): string | undefined {
@@ -73,6 +102,9 @@ export function KioskEnterModal({
   const [exitMode, setExitMode] = useState<'gesture' | 'visible' | 'remote'>('gesture');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
+  const [theme, setTheme] = useState<KioskTheme | undefined>();
+  const [themeLoading, setThemeLoading] = useState(device.configurationId != null);
+  const [themeError, setThemeError] = useState<string | null>(null);
 
   // Library (default source) — the app catalog / uploaded apps.
   const [lib, setLib] = useState<Application[] | null>(null);
@@ -94,6 +126,18 @@ export function KioskEnterModal({
     abortRef.current = ac;
     return () => ac.abort();
   }, []);
+
+  // A manual kiosk action must carry the assigned configuration's visual theme. The command
+  // otherwise replaces the stored kiosk payload and the launcher falls back to black.
+  useEffect(() => {
+    if (device.configurationId == null) return;
+    let cancelled = false;
+    getConfiguration(device.configurationId)
+      .then((c) => { if (!cancelled) setTheme(kioskTheme(c)); })
+      .catch(() => !cancelled && setThemeError('Could not load the configuration theme; the kiosk will use the default look.'))
+      .finally(() => !cancelled && setThemeLoading(false));
+    return () => { cancelled = true; };
+  }, [device.configurationId]);
 
   useEffect(() => {
     listApplications()
@@ -189,11 +233,11 @@ export function KioskEnterModal({
     if (m === 'single' && selected.size > 1) setSelected(new Set());
   }
 
-  const canApply = selected.size > 0 && (mode === 'launcher' || selected.size === 1);
+  const canApply = !themeLoading && selected.size > 0 && (mode === 'launcher' || selected.size === 1);
 
   async function apply() {
     const pkgs = [...selected];
-    const payload = buildKioskPayload({ mode, packages: pkgs, exitMode, password });
+    const payload = buildKioskPayload({ mode, packages: pkgs, exitMode, password }, theme);
     setBusy(true);
     try {
       await queueCommand(device.number, { type: 'kiosk.enter', payload: JSON.stringify(payload) });
@@ -211,7 +255,13 @@ export function KioskEnterModal({
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <div className="modal kiosk-modal">
         <h3>Enter kiosk</h3>
+        <p>
+          Device <strong className="mono">{device.number}</strong>
+          {device.description ? <> · {device.description}</> : null}
+        </p>
         <p className="muted">Pick the apps to lock the device to — from your library, or by scanning the device.</p>
+        {themeLoading && <p className="muted">Loading configured launcher appearance…</p>}
+        {themeError && <p className="muted">{themeError}</p>}
 
         <div className="kiosk-source">
           <button className={`seg-btn ${source === 'library' ? 'on' : ''}`} onClick={() => setSource('library')}>Library</button>
@@ -294,8 +344,9 @@ export function KioskEnterModal({
             </select>
           </label>
           <label className="field">
-            <span>Exit password</span>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="optional" />
+            <span>Kiosk exit PIN</span>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+                   placeholder="Empty: no exit on the device" title={EXIT_PIN_HELP} />
           </label>
         </div>
 

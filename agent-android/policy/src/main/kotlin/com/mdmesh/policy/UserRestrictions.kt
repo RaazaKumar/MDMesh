@@ -21,6 +21,10 @@ object UserRestrictions {
     const val DISALLOW_USB_FILE_TRANSFER = "no_usb_file_transfer"
     const val DISALLOW_MOUNT_PHYSICAL_MEDIA = "no_physical_media"
     const val DISALLOW_FACTORY_RESET = "no_factory_reset"
+    const val DISALLOW_SAFE_BOOT = "no_safe_boot"
+
+    /** API 33. Used by the `wifiRadio` policy (not by [forKey]: it is added only on "off"). */
+    const val DISALLOW_CHANGE_WIFI_STATE = "no_change_wifi_state"
 
     /**
      * The set of `DISALLOW_*` restriction keys backing a capability, or `null` if
@@ -30,6 +34,7 @@ object UserRestrictions {
         "bluetooth" -> setOf(DISALLOW_BLUETOOTH)
         "usbStorage" -> setOf(DISALLOW_USB_FILE_TRANSFER, DISALLOW_MOUNT_PHYSICAL_MEDIA)
         "factoryReset" -> setOf(DISALLOW_FACTORY_RESET)
+        "safeBoot" -> setOf(DISALLOW_SAFE_BOOT)
         else -> null
     }
 
@@ -40,7 +45,10 @@ object UserRestrictions {
      *  - `DISALLOW_BLUETOOTH` was added in API 26 (O).
      *  - The USB-storage restrictions exist from API 21, so the module floor
      *    (API 24) is sufficient.
-     *  - `DISALLOW_FACTORY_RESET` is Device-Owner-only from API 27 (O_MR1).
+     *  - `DISALLOW_FACTORY_RESET` exists from API 21, so the module floor is
+     *    sufficient. It is only *enforced* on a Device/Profile Owner.
+     *  - `DISALLOW_SAFE_BOOT` was added in API 23 (M), below the module floor.
+     *    It is device-wide, so only a Device Owner can set it.
      *
      * Plain `Int` literals (not `Build.VERSION_CODES`) so this stays a pure JVM
      * function, unit-testable without the Android `Build` stub. Returns `null`
@@ -49,7 +57,8 @@ object UserRestrictions {
     fun minSdkForKey(capabilityKey: String): Int? = when (capabilityKey) {
         "bluetooth" -> 26
         "usbStorage" -> 21
-        "factoryReset" -> 27
+        "factoryReset" -> 21
+        "safeBoot" -> 23
         else -> null
     }
 }

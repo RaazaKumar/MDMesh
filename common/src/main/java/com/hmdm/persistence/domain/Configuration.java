@@ -47,7 +47,7 @@ public class Configuration implements CustomerData, Serializable {
     private String name;
     @ApiModelProperty("A description of configuration")
     private String description;
-    @ApiModelProperty("A password for administrator of configuration (MD5 hash)")
+    @ApiModelProperty("The kiosk exit PIN the device asks for before leaving kiosk mode (stored as entered)")
     private String password;
     @ApiModelProperty(hidden = true)
     private int type;
@@ -116,6 +116,14 @@ public class Configuration implements CustomerData, Serializable {
     private Boolean runDefaultLauncher;
     @ApiModelProperty("Flag indicating if screenshots are disabled on the device")
     private Boolean disableScreenshots;
+    @ApiModelProperty("Flag indicating if factory reset is disabled on the device")
+    private Boolean disableFactoryReset;
+    @ApiModelProperty("Flag indicating if rebooting into Safe Mode is disabled on the device")
+    private Boolean disableSafeBoot;
+    @ApiModelProperty("Block volume changes while in kiosk (Android mutes the device meanwhile); sent as kiosk.features.lockVolume")
+    private Boolean kioskLockVolume;
+    @ApiModelProperty("Wi-Fi radio: null = not managed, true = turn on, false = turn off (sent as policies.wifiRadio)")
+    private Boolean wifiRadio;
     @ApiModelProperty("Flag indicating if auto-started apps should be kept in the foreground")
     private Boolean autostartForeground;
     @ApiModelProperty("Time zone settings: null for using default settings, auto for automatic time zone, or Olson time zone string")
@@ -264,6 +272,18 @@ public class Configuration implements CustomerData, Serializable {
 
     public void setPassword(String password) {
         this.password = password;
+    }
+
+    /** The kiosk exit PIN older installs seeded into every configuration (and copies of them inherited). */
+    public static final String DEFAULT_KIOSK_PIN = "12345678";
+
+    /**
+     * True while the kiosk exit PIN ({@link #getPassword()}) is still {@link #DEFAULT_KIOSK_PIN}, so the console can
+     * ask for a new one. Derived and read-only: a value sent back on save is ignored.
+     */
+    @ApiModelProperty(value = "Whether the kiosk exit PIN is still the old default 12345678", readOnly = true)
+    public boolean isDefaultKioskPin() {
+        return DEFAULT_KIOSK_PIN.equals(this.password);
     }
 
     public boolean isSelected() {
@@ -867,6 +887,37 @@ public class Configuration implements CustomerData, Serializable {
     public void setDefaultFilePath(String defaultFilePath) {
         this.defaultFilePath = defaultFilePath;
     }
+    public Boolean getDisableFactoryReset() {
+        return disableFactoryReset;
+    }
+
+    public void setDisableFactoryReset(Boolean disableFactoryReset) {
+        this.disableFactoryReset = disableFactoryReset;
+    }
+
+    public Boolean getDisableSafeBoot() {
+        return disableSafeBoot;
+    }
+
+    public void setDisableSafeBoot(Boolean disableSafeBoot) {
+        this.disableSafeBoot = disableSafeBoot;
+    }
+
+    public Boolean getKioskLockVolume() {
+        return kioskLockVolume;
+    }
+
+    public void setKioskLockVolume(Boolean kioskLockVolume) {
+        this.kioskLockVolume = kioskLockVolume;
+    }
+
+    public Boolean getWifiRadio() {
+        return wifiRadio;
+    }
+
+    public void setWifiRadio(Boolean wifiRadio) {
+        this.wifiRadio = wifiRadio;
+    }
 
     public Configuration newCopy() {
         Configuration copy = new Configuration();
@@ -950,6 +1001,10 @@ public class Configuration implements CustomerData, Serializable {
         copy.setDisplayStatus(isDisplayStatus());
 
         copy.setDefaultFilePath(getDefaultFilePath());
+        copy.setDisableFactoryReset(getDisableFactoryReset());
+        copy.setDisableSafeBoot(getDisableSafeBoot());
+        copy.setKioskLockVolume(getKioskLockVolume());
+        copy.setWifiRadio(getWifiRadio());
 
         return copy;
     }

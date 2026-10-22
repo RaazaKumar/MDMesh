@@ -36,14 +36,20 @@ import java.util.List;
  */
 public interface AgentCommandMapper {
 
-    @Insert({"INSERT INTO agentCommand (deviceNumber, type, payload, requiresCapability, status, createdAt, deliveredAt) " +
-            "VALUES (#{deviceNumber}, #{type}, #{payload}, #{requiresCapability}, #{status}, #{createdAt}, #{deliveredAt})"})
+    @Insert({"INSERT INTO agentCommand (deviceNumber, type, payload, requiresCapability, status, createdAt, deliveredAt, " +
+            "completedAt, detail, agentVersion) " +
+            "VALUES (#{deviceNumber}, #{type}, #{payload}, #{requiresCapability}, #{status}, #{createdAt}, #{deliveredAt}, " +
+            "#{completedAt}, #{detail}, #{agentVersion})"})
     @SelectKey(statement = "SELECT currval('agentcommand_id_seq')", keyColumn = "id", keyProperty = "id",
             before = false, resultType = int.class)
     void insert(AgentCommand command);
 
     @Select({"SELECT * FROM agentCommand WHERE deviceNumber = #{deviceNumber} AND status = 'pending' ORDER BY id"})
     List<AgentCommand> listPending(@Param("deviceNumber") String deviceNumber);
+
+    /** Whether {@link #listPending} would return any row, without reading the rows (one index probe). */
+    @Select({"SELECT EXISTS(SELECT 1 FROM agentCommand WHERE deviceNumber = #{deviceNumber} AND status = 'pending')"})
+    boolean hasPending(@Param("deviceNumber") String deviceNumber);
 
     @Select({"SELECT * FROM agentCommand WHERE deviceNumber = #{deviceNumber} AND id = #{id}"})
     AgentCommand findByDeviceAndId(@Param("deviceNumber") String deviceNumber, @Param("id") Integer id);
@@ -82,8 +88,30 @@ public interface AgentCommandMapper {
     void expireStale(@Param("deviceNumber") String deviceNumber, @Param("pendingCutoff") long pendingCutoff,
                      @Param("deliveredCutoff") long deliveredCutoff, @Param("now") long now);
 
+    /**
+     * End the device's DELIVERED commands of {@code type} handed out before {@code deliveredBefore} (the arrival of
+     * a check-in that carried no result for them): see {@code ConfigReconcileDecision.ABANDONED_DETAIL}. 'expired',
+     * so a late device result still overwrites it ({@link #markResultWithTime}).
+     */
+    @Update({"UPDATE agentCommand SET status = 'expired', completedAt = #{now}, detail = #{detail} " +
+            "WHERE deviceNumber = #{deviceNumber} AND type = #{type} AND status = 'delivered' " +
+            "AND deliveredAt IS NOT NULL AND deliveredAt < #{deliveredBefore}"})
+    int abandonDelivered(@Param("deviceNumber") String deviceNumber, @Param("type") String type,
+                         @Param("deliveredBefore") long deliveredBefore, @Param("now") long now,
+                         @Param("detail") String detail);
+
     @Select({"SELECT * FROM agentCommand WHERE deviceNumber = #{deviceNumber} AND createdAt >= #{since} " +
             "ORDER BY id DESC LIMIT #{limit}"})
     List<AgentCommand> listHistory(@Param("deviceNumber") String deviceNumber,
                                    @Param("since") long since, @Param("limit") int limit);
+
+    @Select({"SELECT COUNT(*) FROM agentCommand WHERE deviceNumber = #{deviceNumber} AND type = #{type} AND status IN ('pending','delivered')"})
+    int countOpenOfType(@Param("deviceNumber") String deviceNumber, @Param("type") String type);
+
+    @Select({"SELECT * FROM agentCommand WHERE deviceNumber = #{deviceNumber} AND type = #{type} ORDER BY id DESC LIMIT 1"})
+    AgentCommand findLatestOfType(@Param("deviceNumber") String deviceNumber, @Param("type") String type);
+
+    @Select({"SELECT * FROM agentCommand WHERE deviceNumber = #{deviceNumber} AND type = #{type} ORDER BY id DESC LIMIT #{limit}"})
+    List<AgentCommand> listLatestOfType(@Param("deviceNumber") String deviceNumber, @Param("type") String type,
+                                        @Param("limit") int limit);
 }

@@ -32,8 +32,8 @@ export interface CommandTemplate {
 export const COMMAND_TEMPLATES: CommandTemplate[] = [
   {
     key: 'wifi-off',
-    label: 'Disable Wi-Fi',
-    description: 'Apply a policy that turns the device Wi-Fi radio off.',
+    label: 'Lock Wi-Fi settings',
+    description: 'Apply a policy that locks the device Wi-Fi settings (the radio is left as it is).',
     request: {
       type: 'policy.apply',
       requiresCapability: 'policy.wifi',
@@ -42,8 +42,8 @@ export const COMMAND_TEMPLATES: CommandTemplate[] = [
   },
   {
     key: 'wifi-on',
-    label: 'Enable Wi-Fi',
-    description: 'Apply a policy that turns the device Wi-Fi radio on.',
+    label: 'Unlock Wi-Fi settings',
+    description: 'Apply a policy that lifts the Wi-Fi settings lock.',
     request: {
       type: 'policy.apply',
       requiresCapability: 'policy.wifi',
@@ -245,11 +245,14 @@ export interface DeviceState {
   androidRelease: string; lastBootAt: number; updatedAt: number;
   agentVersion?: string | null;
   powerMode?: string | null;
+  appliedConfigRevision?: string | null;
 }
 
 export interface CommandHistoryItem {
   id: number | string; type: string; status: string;
-  detail?: string | null; createdAt?: number; completedAt?: number;
+  detail?: string | null; createdAt?: number; deliveredAt?: number; completedAt?: number;
+  /** Server-derived package name for app.install / app.uninstall; absent otherwise. Payloads are never returned. */
+  subject?: string | null;
 }
 
 export async function getDeviceState(deviceId: number | string): Promise<DeviceState | null> {
@@ -280,6 +283,7 @@ export interface AppInstallSpec {
   url: string;
   packageName: string;
   versionCode?: number;
+  /** The APK's SHA-256 (required for a URL not hosted by MDMesh; the server hashes its own files). The agent refuses an install without one. */
   sha256?: string;
   runAfterInstall?: boolean;
   /** Split-APK bundle: when present the agent installs all parts in one session

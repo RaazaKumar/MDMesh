@@ -3,13 +3,34 @@
 # server on the host and assumes you terminate TLS yourself (your own reverse proxy / cert, or Caddy in
 # front). For the turnkey experience use ./setup.sh (Docker). Flags: -y/--yes (skip confirm), -v/--verbose
 # (stream all output instead of hiding it in the log). Best-effort + idempotent; review before prod use.
+# shellcheck source-path=SCRIPTDIR  # lets shellcheck -x follow lib/*.sh from any working directory
 set -euo pipefail
+# An exported CDPATH makes cd (here and in every child, e.g. `bash -c 'cd web && …'`) resolve a relative path against
+# CDPATH's directories, not the current one — silently building or reading from a same-named directory elsewhere. Unset
+# it for this script and its children.
+unset CDPATH
 # Secrets hygiene: files this script writes (the install log, ROOT.xml, temp downloads) can carry
 # the DB password / hash secret, so create everything owner-only by default. Tomcat and the server
-# run as root here, so 0600/0700 artifacts stay readable by the things that need them.
+# run as the mdmesh user; the deploy step chowns their trees to it, so 0600/0700 artifacts stay
+# readable by the things that need them.
 umask 077
-cd "$(dirname "$0")/.."
+export PATH="/usr/sbin:/sbin:$PATH"   # useradd/userdel/pg tools live here; not every root shell has it
+# -P resolves symbolic links so REPO is the real checkout.
+cd -P -- "$(dirname -- "$0")/.."
 REPO="$PWD"   # repo root — used for absolute paths inside subshells (e.g. exploding the WAR)
+# Shared DB provisioning rules (seed gate, verified seed, post-seed repairs) — same file setup.sh uses.
+# shellcheck source=lib/db.sh
+. "$REPO/install/lib/db.sh"
+# shellcheck source=lib/version.sh
+. "$REPO/install/lib/version.sh"
+# shellcheck source=lib/url.sh
+. "$REPO/install/lib/url.sh"
+# as_svc_user / as_postgres / as_mdmesh_role: the service account, postgres (superuser-only statements, in the postgres
+# database), or the mdmesh role (anything reading the mdmesh database), isolated from root's environment and terminal.
+# shellcheck source=lib/runas.sh
+. "$REPO/install/lib/runas.sh"
+# shellcheck source=lib/release.sh
+. "$REPO/install/lib/release.sh"
 
 [ "$(id -u)" = "0" ] || { echo "Run as root (sudo)."; exit 1; }
 command -v apt-get >/dev/null || { echo "This script targets Debian/Ubuntu."; exit 1; }
@@ -96,10 +117,12 @@ printf '\n  %sMDMesh · native install%s\n' "$c_bold" "$c_reset"
 cat <<WARN
 
   ${c_yel}⚠  This will modify THIS host:${c_reset}
-    • apt-get install openjdk-17-jdk, postgresql, maven, nodejs, npm, curl, python3, aapt
+    • apt-get install postgresql, maven, curl, python3, aapt (and openjdk-17-jdk where the distro packages it)
+    • download Node.js 24 and/or a JDK 17 into /opt/mdmesh-runtime when this host has no suitable one
     • create or alter a PostgreSQL role and database "mdmesh" (resets that role's password)
     • download and unpack Apache Tomcat 9 into /opt/mdmesh-tc (clears its webapps/)
-    • write config, logs and uploaded files under /opt/mdmesh
+    • write config and uploaded files under /opt/mdmesh (the server logs to the systemd journal)
+    • write the updater's settings to /etc/mdmesh/supervisor.env
     • start Tomcat, run database migrations, and seed the admin account
 
   Intended for a dedicated server you control. This script does not undo these changes.
@@ -112,48 +135,476 @@ if [ "$ASSUME_YES" != "1" ]; then
   [ "$_confirm" = "yes" ] || { echo "  Aborted — no changes made."; exit 1; }
 fi
 
-SALT='5YdSYHyg2U'
-rand() { openssl rand -hex 24; }
-pwhash() { local m; m=$(printf '%s' "$1" | md5sum | awk '{print toupper($1)}'); printf '%s' "${m}${SALT}" | sha1sum | awk '{print $1}'; }
+rand() { mdm_rand; }
 
 printf '\n'
-read -rp "  Public base URL (e.g. https://mdm.example.com): " BASE_URL
-# HTTP port Tomcat listens on. Override non-interactively with HTTP_PORT=9090; default 8080.
-HTTP_PORT="${HTTP_PORT:-}"
-if [ -z "$HTTP_PORT" ]; then read -rp "  HTTP port [8080]: " _p; HTTP_PORT="${_p:-8080}"; fi
-case "$HTTP_PORT" in ''|*[!0-9]*) echo "  Port must be a number."; exit 1 ;; esac
-{ [ "$HTTP_PORT" -ge 1 ] && [ "$HTTP_PORT" -le 65535 ]; } || { echo "  Port must be 1-65535."; exit 1; }
+# The base URL (BASE_URL) is settled below, once the existing install's ROOT.xml can be read the safe way.
+case "${SMTP_PORT-25}" in ''|*[!0-9]*) echo "  SMTP_PORT must be a number."; exit 1 ;; esac
+# SMTP_SSL / SMTP_STARTTLS: what the server and the Docker .env accept ("true" or "1", any case; else false), written
+# to ROOT.xml as true/false.
+for _v in SMTP_SSL SMTP_STARTTLS; do
+  [ -n "${!_v+x}" ] || continue
+  case "${!_v,,}" in true|1) printf -v "$_v" true ;; false|0) printf -v "$_v" false ;;
+    *) echo "  $_v must be true or false."; exit 1 ;; esac
+done
+# LEGACY_DEVICE_API: same values, written to ROOT.xml as 1/0.
+if [ -n "${LEGACY_DEVICE_API+x}" ]; then
+  case "${LEGACY_DEVICE_API,,}" in true|1) LEGACY_DEVICE_API=1 ;; false|0) LEGACY_DEVICE_API=0 ;;
+    *) echo "  LEGACY_DEVICE_API must be 1 or 0."; exit 1 ;; esac
+fi
+# GITHUB_REPO / GITHUB_TOKEN: the updater's settings. They are written to /etc/mdmesh/supervisor.env, which systemd reads
+# (and a root shell might source), so they are allowlists: repo_ok is owner/name in GitHub's characters, with no "." or
+# ".." for either part; token_ok is letters, digits and "_" (ghp_…, github_pat_…, a 40-hex classic token), or empty (no
+# token). A value passed in the environment that fails stops the install here, before anything changes. (Kept across
+# re-runs: see the release-fetch step.)
+repo_ok() {
+  case "$1" in */*/*|*[!${_MDM_ALNUM}._/-]*) return 1 ;; */*) ;; *) return 1 ;; esac
+  case "${1%%/*}" in ''|.|..) return 1 ;; esac
+  case "${1#*/}" in ''|.|..) return 1 ;; esac
+}
+token_ok() { case "$1" in *[!${_MDM_ALNUM}_]*) return 1 ;; esac; }
+if [ -n "${GITHUB_REPO:-}" ] && ! repo_ok "$GITHUB_REPO"; then echo "  GITHUB_REPO must be owner/name (e.g. MDMesh-app/MDMesh)."; exit 1; fi
+if [ -n "${GITHUB_TOKEN:-}" ] && ! token_ok "$GITHUB_TOKEN"; then echo "  GITHUB_TOKEN must be a GitHub token: letters, digits and _ only."; exit 1; fi
+# The HTTP port (HTTP_PORT) is settled below, once the existing install's server.xml can be read the safe way.
 DB_PASSWORD=$(rand); HASH_SECRET=$(rand); ADMIN_PASSWORD=$(rand); RESET_TOKEN=$(openssl rand -hex 16)
+JWT_SECRET=$(openssl rand -hex 64)   # jwt.secretkey: hex only (see the reuse rule below)
 BASE_DIR=/opt/mdmesh
 CATALINA=/opt/mdmesh-tc
 TOMCAT_VER=9.0.89
+# Runtimes the installer downloads when the distro's are missing or too old (Debian 12 / Ubuntu 24.04 ship Node 18; Debian
+# 13 packages no JDK 17). Pinned with their published SHA-256s, unpacked under $RUNTIME_DIR: root-owned and never handed
+# to $SVC_USER, since root runs them during the install. NODE_VER moves with web/package.json "engines".
+RUNTIME_DIR=/opt/mdmesh-runtime
+NODE_VER=24.21.0
+JDK17_VER=17.0.20.1+1
+case "$(uname -m)" in
+  x86_64)  NODE_ARCH=x64   NODE_SHA=6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff
+           JDK17_ARCH=x64     JDK17_SHA=3808d1d15e3ec6bd5b84057fb5d84c33d8a1536a258146bcea2e603fc726e08e ;;
+  aarch64) NODE_ARCH=arm64 NODE_SHA=724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5
+           JDK17_ARCH=aarch64 JDK17_SHA=457b57af8f9c93ec39080bb8c764f559dc8c89a6da1a39d718a400b7890d3e41 ;;
+  *)       NODE_ARCH="" JDK17_ARCH="" ;;
+esac
+# Tomcat lifecycle helpers. CATALINA_PID lets `catalina.sh stop -force` actually kill a JVM that ignores
+# the shutdown command (the server keeps scheduler threads alive after context stop), and the pgrep
+# fallback covers instances started by older versions of this script without a PID file.
+export CATALINA_PID="$CATALINA/tomcat.pid"
+SVC_USER=mdmesh            # unprivileged account Tomcat runs as (mirrors the Docker image)
+SVC_UNIT=mdmesh-server     # systemd unit that owns Tomcat
+SUP_UNIT=mdmesh-supervisor # systemd unit that owns the updater supervisor (also runs as $SVC_USER)
+# The supervisor's settings (GITHUB_TOKEN included). They live outside $BASE_DIR on purpose: systemd reads an
+# EnvironmentFile as root and follows links, so one inside the service user's tree would let that user point it at any
+# root-only KEY=VALUE file and receive its contents in the supervisor's environment.
+SUP_ENV_DIR=/etc/mdmesh
+# Root writes into $CATALINA and $BASE_DIR, which this script chowns to $SVC_USER (on this run and on every earlier one),
+# so a link planted there must never be followed. guard_under ROOT REL refuses (fails the install) when ROOT or any
+# component of ROOT/REL is a symbolic link. write_under ROOT REL CMD... guards REL, runs CMD with its stdout going to a
+# fresh mode-600 file (mktemp) in REL's directory, and renames that over REL in one step (mv -fT never follows a link or
+# descends into a directory there). The temp file is named .NAME.mdmesh-tmp.XXXXXX, and the ones a killed run left
+# behind (ROOT.xml's hold its secrets) are removed first, by that pattern only: a plain NAME.?????? glob would also
+# delete an admin's NAME.backup. (Earlier versions used NAME.XXXXXX; such leftovers are left alone.) tc_guard/tc_write REL and base_guard/base_write REL are these for $CATALINA and $BASE_DIR. Before these run,
+# Tomcat and the supervisor (both run as $SVC_USER) are stopped, every other $SVC_USER process is killed (kill_svc_user),
+# and the install stops if the account has a crontab or at jobs that could start a new one (refuse_svc_user_jobs); the
+# two units are started again after the last write. That leaves only a process that some other root service starts as
+# $SVC_USER in between, which none does unless an admin set one up. So these guards stay, and root reads the files in
+# these trees as $SVC_USER (svc_cat) rather than trusting that nothing can race it.
+guard_under() {
+  local root="$1" p="$1" part
+  local -a parts
+  IFS=/ read -r -a parts <<< "$2"
+  if [ -L "$p" ]; then _fail "Refusing to write under $root: it is a symbolic link. Remove it and re-run."; fi
+  for part in "${parts[@]}"; do
+    p="$p/$part"
+    if [ -L "$p" ]; then _fail "Refusing to write $root/$2: $p is a symbolic link (the service user owns this tree). Remove it and re-run."; fi
+  done
+}
+write_under() {
+  local root="$1" rel="$2" dir name tmp
+  shift 2
+  guard_under "$root" "$rel"
+  dir=$(dirname "$root/$rel") name=$(basename "$rel")
+  mkdir -p "$dir"
+  rm -f "$dir/.$name".mdmesh-tmp.??????
+  tmp=$(mktemp "$dir/.$name.mdmesh-tmp.XXXXXX")
+  if "$@" > "$tmp" && chmod 600 "$tmp" && mv -fT "$tmp" "$root/$rel"; then return 0; fi
+  rm -f "$tmp"
+  _fail "Could not write $root/$rel"
+}
+tc_guard()   { guard_under "$CATALINA" "$1"; }
+tc_write()   { local rel="$1"; shift; write_under "$CATALINA" "$rel" "$@"; }
+base_guard() { guard_under "$BASE_DIR" "$1"; }
+base_write() { local rel="$1"; shift; write_under "$BASE_DIR" "$rel" "$@"; }
+have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+# unit_installed NAME: NAME.service is installed. Not `systemctl list-unit-files | grep -q`: grep exits at the first
+# match, systemctl then gets SIGPIPE writing its footer, and under pipefail the pipeline fails, so the unit reads as absent.
+unit_installed() { have_systemd && [ -n "$(systemctl list-unit-files --no-legend "$1.service" 2>/dev/null)" ]; }
+# Stops the supervisor unit if it exists (older installs ran it as root; either way it must not run during root writes).
+# A unit that does not run as $SVC_USER is also disabled, before the first root write: the deploy step's chown -R hands
+# its code to $SVC_USER, and if this run stopped before the unit is rewritten, the next boot would run that code as root.
+# The supervisor step re-enables the rewritten unit; one that already runs as $SVC_USER is left enabled.
+stop_supervisor() {
+  if unit_installed "$SUP_UNIT"; then
+    systemctl stop "$SUP_UNIT" >/dev/null 2>&1 || true
+    if [ "$(systemctl show -p User --value "$SUP_UNIT" 2>/dev/null)" != "$SVC_USER" ]; then
+      systemctl disable "$SUP_UNIT" >> "$LOGFILE" 2>&1 || _fail "Could not disable the old ${SUP_UNIT} unit (it runs as root)"
+    fi
+  fi
+}
+# svc_user_pids: the pids of $SVC_USER's processes, one per line, leaving out container processes that merely run as the
+# same numeric uid (postgres, redis and our own server image run as uid 999, which useradd --system often hands out;
+# `pkill -u` would kill them too). Those are in another PID namespace but still in the host's user namespace, which only
+# a privileged container runtime sets up. A process the account starts is either in the host's PID namespace or, to get
+# a PID namespace of its own without privileges, in a new user namespace too, so it is always listed. (That is why this
+# is not `pgrep --ns 1 --nslist pid`: it would miss such a process.) uninstall-native.sh has the same function.
+svc_user_pids() {
+  local host_pid host_user p
+  host_pid=$(readlink /proc/1/ns/pid) host_user=$(readlink /proc/1/ns/user)
+  for p in $(pgrep -u "$SVC_USER" || true); do
+    [ "$(readlink "/proc/$p/ns/pid")" != "$host_pid" ] && [ "$(readlink "/proc/$p/ns/user")" = "$host_user" ] && continue
+    echo "$p"
+  done
+}
+# Kills every process still running as $SVC_USER (svc_user_pids) and waits until none is left. Stopping the two units
+# does not end a process the account started some other way (a cron or at job, or anything on a host without systemd),
+# and one could race the root writes below. Before the account exists (a fresh install) there is nothing to kill.
+kill_svc_user() {
+  id -u "$SVC_USER" >/dev/null 2>&1 || return 0
+  local _ pids
+  for _ in $(seq 1 50); do
+    pids=$(svc_user_pids)
+    [ -n "$pids" ] || return 0
+    # shellcheck disable=SC2086  # one pid per word
+    kill -KILL $pids 2>/dev/null || true
+    sleep 0.2
+  done
+  _fail "Could not stop every $SVC_USER process (still running: $(svc_user_pids | tr '\n' ' ')). Stop them and re-run."
+}
+# Stops the install if $SVC_USER has a crontab or pending at jobs: cron or atd could start one as $SVC_USER at any moment,
+# racing the root writes, and kill_svc_user cannot stop a process that does not exist yet. The account is a system
+# account this script created, and it never legitimately has either. Called twice: first before anything is changed
+# (right after the port preflight), so the usual refusal leaves the running install untouched; then again after
+# kill_svc_user (argument "stopped"), because a process of the account could have added a job in between, and after the
+# kill none is left to add another before the writes. That second refusal comes after Tomcat and the supervisor were
+# stopped, so it says so and that only a re-run restores them. Comment-only crontab lines run nothing and are ignored. The jobs are
+# not printed: the account wrote them, and they are not for root's terminal.
+refuse_svc_user_jobs() {
+  id -u "$SVC_USER" >/dev/null 2>&1 || return 0
+  local cron=0 at=0
+  if command -v crontab >/dev/null 2>&1; then
+    cron=$(crontab -l -u "$SVC_USER" 2>/dev/null | grep -cvE '^[[:space:]]*(#|$)' || true)
+  fi
+  if command -v atq >/dev/null 2>&1; then
+    at=$(atq 2>/dev/null | awk -v u="$SVC_USER" '$NF == u' | grep -c . || true)
+  fi
+  { [ "${cron:-0}" -gt 0 ] || [ "${at:-0}" -gt 0 ]; } || return 0
+  printf '\n  %s✗ the %s account has scheduled jobs%s: cron or at would run them as %s while this installer writes to\n' "$c_red" "$SVC_USER" "$c_reset" "$SVC_USER"
+  printf '    its files. It is a system account this installer created, and it never has jobs of its own.\n'
+  [ "${cron:-0}" -gt 0 ] && printf '    • a crontab with %s job line(s). Inspect: crontab -l -u %s   Remove: crontab -r -u %s\n' "$cron" "$SVC_USER" "$SVC_USER"
+  [ "${at:-0}" -gt 0 ] && printf '    • %s at job(s). Inspect: atq, then at -c <id>   Remove: atrm <id>\n' "$at"
+  printf '  Find out how they got there (it can mean the server was compromised), remove them, then re-run.\n'
+  if [ "${1:-}" = stopped ]; then
+    printf '  %sThe server and the updater supervisor are stopped now%s: this run stopped them before it found the jobs.\n' "$c_yel" "$c_reset"
+    printf '    Remove the jobs and re-run this installer: that finishes the upgrade and starts both. Do not start the old\n'
+    printf '    units by hand: the database role already has a new password the old server config lacks'
+    [ "${REPLACE_DATA:-}" = yes ] && printf ' (and the database\n    was already recreated empty)'
+    printf ',\n    and an updater unit from before v0.4 runs as root code that %s can change.\n' "$SVC_USER"
+  fi
+  exit 1
+}
+# svc_cat FILE: FILE's contents, read as $SVC_USER. For files in the trees that account owns: root would follow a link
+# planted there and read any root-only file. Before the account exists (a fresh install, or an upgrade from a version
+# whose Tomcat ran as root) nothing unprivileged owns those trees, so root reads them.
+# It reads a REGULAR file only ([ -f ] rejects a FIFO, which cat would block on forever, and a symlink to a device such
+# as /dev/zero, which would read without end) and at most 64 KiB (these config files are far smaller). Fails (empty, rc 1)
+# when the path is missing or not a regular file, which callers already treat as "cannot read".
+svc_cat() {
+  if id -u "$SVC_USER" >/dev/null 2>&1; then
+    # shellcheck disable=SC2016  # $1 is the inner sh's positional (the path), not a variable to expand here
+    as_svc_user sh -c '[ -f "$1" ] && head -c 65536 -- "$1"' _ "$1"
+  else
+    [ -f "$1" ] && head -c 65536 -- "$1"
+  fi
+}
+# as_svc_user (Tomcat's scripts as $SVC_USER), as_postgres and as_mdmesh_role (database clients) are in lib/runas.sh.
+port_holder() {
+  if command -v ss >/dev/null 2>&1; then ss -ltnp 2>/dev/null | awk -v p=":$HTTP_PORT$" '$4 ~ p {print; exit}'
+  elif command -v lsof >/dev/null 2>&1; then lsof -iTCP:"$HTTP_PORT" -sTCP:LISTEN -nP 2>/dev/null | awk 'NR==2{print; exit}'; fi
+}
+# Classifies whatever listens on $HTTP_PORT: "free", "unit" (our own systemd unit), "legacy" (a Tomcat started
+# from $CATALINA by an older version of this script, before the unit existed) or "foreign" (anything else —
+# typically a leftover Headwind/hmdm Tomcat or another web server). Only the first three may be stopped by us.
+port_owner() {
+  local holder hpid
+  holder=$(port_holder); [ -n "$holder" ] || { echo free; return; }
+  hpid=$(printf '%s' "$holder" | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2)
+  if have_systemd && [ -n "$hpid" ] && [ "$(systemctl show -p MainPID --value "$SVC_UNIT" 2>/dev/null)" = "$hpid" ]; then
+    echo unit
+  elif [ -n "$hpid" ] && tr '\0' ' ' < "/proc/${hpid}/cmdline" 2>/dev/null | grep -q "catalina.base=${CATALINA}"; then
+    echo legacy
+  else
+    echo foreign
+  fi
+}
+refuse_foreign_port() {
+  printf '  %s✗ port %s is already in use%s by another server:\n' "$c_red" "$HTTP_PORT" "$c_reset"
+  printf '    %s%s%s\n' "$c_dim" "$(port_holder)" "$c_reset"
+  printf '  Not an MDMesh Tomcat, so this installer will not stop it. Stop it yourself, or pick another port\n'
+  printf '  (HTTP_PORT=9090), then re-run.  %s(fuser -k %s/tcp kills whatever holds the port)%s\n' "$c_dim" "$HTTP_PORT" "$c_reset"
+  exit 1
+}
+stop_tomcat() {
+  # Preferred: the systemd unit (cgroup-tracked, kills stragglers itself), and then catalina.sh is not run at all. The
+  # catalina.sh / pgrep paths below only matter without a unit (no systemd, or a Tomcat an older version of this script
+  # started). catalina.sh runs as $SVC_USER (as_svc_user), never as root; before that account exists (an install from
+  # before v0.2.9, whose Tomcat ran as root) the signals below stop Tomcat on their own.
+  local unit=0 p i
+  if unit_installed "$SVC_UNIT"; then
+    unit=1; systemctl stop "$SVC_UNIT" >/dev/null 2>&1 || true
+  fi
+  [ -x "$CATALINA/bin/catalina.sh" ] || return 0
+  if [ "$unit" = 0 ] && id -u "$SVC_USER" >/dev/null 2>&1; then
+    as_svc_user "$CATALINA/bin/catalina.sh" stop 30 -force >/dev/null 2>&1 || true
+  fi
+  for p in $(pgrep -f "^[^ ]*/java .*catalina.base=$CATALINA" || true); do kill "$p" 2>/dev/null || true; done
+  for i in $(seq 1 30); do pgrep -f "^[^ ]*/java .*catalina.base=$CATALINA" >/dev/null || break; sleep 1; done
+  for p in $(pgrep -f "^[^ ]*/java .*catalina.base=$CATALINA" || true); do kill -9 "$p" 2>/dev/null || true; done
+  for i in $(seq 1 15); do [ -z "$(port_holder)" ] && break; sleep 1; done
+  rm -f "$CATALINA_PID"
+}
+# readable_after_heal ROOT REL: ROOT/REL is a regular file and no component of the path is a symbolic link, so when
+# $SVC_USER cannot read it the cause is ownership or modes that heal_trees (below) repairs: a run interrupted between
+# root's first write into these trees and the chown -R that hands them over leaves root-owned, mode 600 files there
+# (server.xml, ROOT.xml). Root only stats the path here; it never opens it. A link anywhere on the path, or anything but a
+# regular file, is not "readable after the heal", and the caller stops as before.
+readable_after_heal() {
+  local p="$1" part
+  local -a parts
+  id -u "$SVC_USER" >/dev/null 2>&1 || return 1
+  [ -L "$p" ] && return 1
+  IFS=/ read -r -a parts <<< "$2"
+  for part in "${parts[@]}"; do p="$p/$part"; [ -L "$p" ] && return 1; done
+  [ -f "$p" ]
+}
+# heal_trees: hands $CATALINA and $BASE_DIR to $SVC_USER, exactly as the chown -R at the end of the deploy step does, but
+# before root's first write there. It repairs what a run interrupted in between (kill -9, a dropped session, a full disk)
+# left root-owned: without it every later run stopped at reading server.xml or ROOT.xml as $SVC_USER and the server stayed
+# down. It runs under the same conditions as that chown: no $SVC_USER process is left (stop_tomcat, stop_supervisor,
+# kill_svc_user, then refuse_svc_user_jobs stopped), chown -R follows no links, and it relies on fs.protected_hardlinks=1
+# (the default) like that chown. It hands over nothing the end of this run would not. Before the account exists (a fresh
+# install, or an install from before v0.2.9 whose Tomcat ran as root) there is nothing to hand over.
+heal_trees() {
+  local d
+  id -u "$SVC_USER" >/dev/null 2>&1 || return 0
+  for d in "$CATALINA" "$BASE_DIR"; do
+    if [ -d "$d" ] && [ ! -L "$d" ]; then
+      chown -R "$SVC_USER:$SVC_USER" "$d" || _fail "Could not hand $d back to $SVC_USER"
+    fi
+  done
+}
+
+# Upgrades re-run this script. hash.secret signs enrollment/sync requests and download URLs, so rotating
+# it would silently break every already-enrolled device; reuse the value from the existing ROOT.xml.
+# (DB_PASSWORD is different: it is re-applied to the role via ALTER USER below, so a fresh one is fine.)
+_old_root="$CATALINA/conf/Catalina/localhost/ROOT.xml"
+# It is read as $SVC_USER (svc_cat), whose tree $CATALINA is. If that account cannot read it because it is root-owned (a
+# run interrupted before it handed the tree over; see readable_after_heal), it is read again after heal_trees, before
+# ROOT.xml is rewritten. Otherwise (a link, anything but a regular file) stop: carrying on would silently rotate the
+# secrets enrolled devices depend on.
+_old_xml=; _old_root_deferred=0
+_old_root_unreadable="Could not read $_old_root as $SVC_USER. It holds hash.secret, which enrolled devices depend on: if it is a symbolic link, remove it; if root owns it, chown it to $SVC_USER. Then re-run."
+if [ -f "$_old_root" ] && ! _old_xml=$(svc_cat "$_old_root" 2>>"$LOGFILE"); then
+  if readable_after_heal "$CATALINA" conf/Catalina/localhost/ROOT.xml; then
+    _old_root_deferred=1
+    info "The existing ROOT.xml is root-owned (an earlier run was interrupted): it is read once this run has handed the tree back"
+  else
+    _fail "$_old_root_unreadable"
+  fi
+fi
+# Value of <Parameter name="$1" value="…"/> in the existing ROOT.xml; empty when there is none.
+old_root_param() { printf '%s\n' "$_old_xml" | sed -n "s/.*name=\"$1\"[[:space:]]*value=\"\([^\"]*\)\".*/\1/p" | head -n 1; }
+
+# Public base URL. BASE_URL=https://mdm.example.com sets it; a fresh install with -y requires it. Otherwise a re-run keeps
+# the one the install already has (base.url in ROOT.xml): -y uses it, an interactive run offers it as the default. Erase
+# (REPLACE_DATA=yes) keeps it too: it is this host's public address, not data in the database, and the devices that will
+# enroll again are given the same address. The value from ROOT.xml is checked like any other (mdm_check_base_url) before
+# it is used, since $SVC_USER can write that file; one that fails is ignored, as on a fresh install. When ROOT.xml can
+# only be read after heal_trees (see above), -y (or Enter at the prompt) reads it there instead.
+BASE_URL="${BASE_URL:-}"; _url_deferred=0
+if [ -z "$BASE_URL" ]; then
+  _cur_url=$(old_root_param base.url)
+  if [ -n "$_cur_url" ] && ! mdm_check_base_url _cur_url; then
+    info "That is the base URL in the existing ROOT.xml: ignoring it"; _cur_url=
+  fi
+  if [ -n "$_cur_url" ]; then
+    [ "$ASSUME_YES" = 1 ] || read -rp "  Public base URL [${_cur_url}]: " BASE_URL
+    if [ -z "$BASE_URL" ]; then BASE_URL=$_cur_url; info "Keeping the base URL ${BASE_URL} (from ROOT.xml; set BASE_URL to change it)"; fi
+  elif [ "$_old_root_deferred" = 1 ]; then
+    [ "$ASSUME_YES" = 1 ] || read -rp "  Public base URL [keep the current one]: " BASE_URL
+    [ -n "$BASE_URL" ] || { _url_deferred=1; info "Keeping the base URL in ROOT.xml (read once this run has handed the tree back)"; }
+  else
+    [ "$ASSUME_YES" = 1 ] && { echo "  BASE_URL must be set when running with -y (e.g. BASE_URL=https://mdm.example.com)."; exit 1; }
+    read -rp "  Public base URL (e.g. https://mdm.example.com): " BASE_URL
+  fi
+fi
+# install/lib/url.sh: http(s)://host[:port][/path]; lower-cases the scheme.
+[ "$_url_deferred" = 1 ] || mdm_check_base_url BASE_URL || exit 1
+
+# HTTP port Tomcat listens on. HTTP_PORT=9090 sets it. Otherwise a re-run keeps the port the install already serves on (the
+# HTTP/1.1 connector in its server.xml, read as $SVC_USER), and a fresh install takes 8080: -y takes that default, an
+# interactive run asks with it as the default. If that server.xml exists but $SVC_USER cannot read it yet (root-owned by
+# an interrupted run; see readable_after_heal), the port is read once heal_trees has run, and the early port check below
+# is skipped: our own server is down in that state anyway, and the check before Tomcat starts still runs.
+connector_port() { sed -nE 's#.*<Connector port="([0-9]+)" protocol="HTTP/1\.1".*#\1#p' | head -n 1; }
+check_port() {
+  case "$HTTP_PORT" in ''|*[!0-9]*) echo "  Port must be a number."; exit 1 ;; esac
+  { [ "$HTTP_PORT" -ge 1 ] && [ "$HTTP_PORT" -le 65535 ]; } || { echo "  Port must be 1-65535."; exit 1; }
+}
+_cur_port=""; _port_deferred=0
+if [ -e "$CATALINA/conf/server.xml" ] || [ -L "$CATALINA/conf/server.xml" ]; then
+  if _sx=$(svc_cat "$CATALINA/conf/server.xml" 2>>"$LOGFILE"); then _cur_port=$(printf '%s\n' "$_sx" | connector_port)
+  elif readable_after_heal "$CATALINA" conf/server.xml; then _port_deferred=1; fi
+fi
+_port_hint=${_cur_port:-8080}; [ "$_port_deferred" = 0 ] || _port_hint="keep the current port"
+HTTP_PORT="${HTTP_PORT:-}"
+if [ -z "$HTTP_PORT" ] && [ "$ASSUME_YES" != 1 ]; then read -rp "  HTTP port [${_port_hint}]: " HTTP_PORT; fi
+if [ -n "$HTTP_PORT" ]; then _port_deferred=0
+elif [ "$_port_deferred" = 0 ]; then HTTP_PORT=${_cur_port:-8080}; fi
+[ "$_port_deferred" = 1 ] || check_port
+
+# Fail fast on a port conflict, before packages are installed, the build runs or the running server is
+# stopped — losing the bind later would leave our Tomcat dead while the other server answers with 404s.
+if [ "$_port_deferred" = 0 ] && [ "$(port_owner)" = foreign ]; then refuse_foreign_port; fi
+# Likewise refuse on scheduled jobs of the service account now, while the running install is untouched (it is checked
+# again after the stop below, which closes the gap; see refuse_svc_user_jobs).
+refuse_svc_user_jobs
+
+# xml_attr RAW: RAW escaped for an XML attribute value (an SMTP password with & or " must not break ROOT.xml).
+xml_attr() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
+# root_param ENV_VAR PARAM DEFAULT: the XML-ready value for <Parameter name="PARAM">. The env var when it is set (even to
+# "", which is how a value is cleared), else the value in the existing ROOT.xml as it stands (already escaped), else
+# DEFAULT. Settings made on an earlier run therefore survive re-runs and upgrades.
+root_param() {
+  if [ -n "${!1+x}" ]; then xml_attr "${!1}"
+  elif grep -q "name=\"$2\"" <<< "$_old_xml"; then old_root_param "$2"
+  else xml_attr "$3"; fi
+}
+# jwt.secretkey signs REST API clients' JWTs (/rest/public/jwt/login), so it is kept the same way: those tokens then
+# survive restarts and upgrades, and an install from before it existed gets the key generated above. JJWT 0.9.1
+# base64-decodes the key and silently drops characters outside the base64 alphabet and a trailing partial 4-character
+# group, so only hex, a multiple of 4 characters and at least 128 long (what we generate) is reused; anything else
+# (a hand edit) is replaced. Whitespace is not part of the key (the XML parser turns a tab or newline in the value into
+# a space, which the JWT library drops), so a hand edit that added some is not a reason to rotate it. docker/entrypoint.sh
+# applies the same rules to JWT_SECRET and its key file.
+jwt_key_ok() { case "$1" in ''|*[!0-9a-fA-F]*) return 1 ;; esac; [ "${#1}" -ge 128 ] && [ $(( ${#1} % 4 )) -eq 0 ]; }
+# adopt_old_secrets: keep hash.secret and jwt.secretkey from the existing ROOT.xml (_old_xml).
+adopt_old_secrets() {
+  _old_secret=$(old_root_param hash.secret)
+  if [ -n "$_old_secret" ]; then HASH_SECRET="$_old_secret"; info "Reusing hash.secret from the existing install (enrolled devices keep working)"; fi
+  _old_jwt=$(old_root_param jwt.secretkey | tr -d '[:space:]')
+  if jwt_key_ok "$_old_jwt"; then JWT_SECRET="$_old_jwt"; info "Reusing jwt.secretkey from the existing install (API clients stay signed in)"
+  elif [ -n "$_old_jwt" ]; then info "Replacing the existing jwt.secretkey: it is not hex, a multiple of 4 and at least 128 characters (the JWT library would drop characters)"; fi
+}
+[ "$_old_root_deferred" = 1 ] || adopt_old_secrets
 
 step "Installing dependencies"
-# Tolerate an unrelated broken third-party APT source (e.g. a Docker repo on a codename Docker doesn't
-# publish for → "does not have a Release file") — the native install only needs base Debian packages.
-run "openjdk-17-jdk, postgresql, maven, nodejs, npm, curl, python3, aapt" bash -c \
-  'apt-get update -y || echo "(some apt sources failed to refresh — continuing)"; DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jdk postgresql maven nodejs npm curl python3 aapt'
-# minisign verifies release-manifest signatures for the updater supervisor. Best-effort: without it
-# the supervisor still runs but reports releases as unverified (and never mirrors an APK).
-DEBIAN_FRONTEND=noninteractive apt-get install -y minisign >> "$LOGFILE" 2>&1 || info "minisign unavailable — updater will report releases as unverified"
-
-step "Selecting the Java 17 toolchain"
-# HERMETIC BUILD: pin JDK 17 and never fall back to the host default JDK. The server uses Lombok 1.18.20,
-# whose annotation processor only runs on JDK <=17; on a newer default JDK (21/25/…) it generates nothing
-# and the build dies with hundreds of "cannot find symbol". This keeps the build identical on any host.
+# HERMETIC BUILD: pin JDK 17 and never fall back to the host default JDK. JDK 17 is the one supported server
+# JDK (CI, the Docker build + tomcat:9.0-jdk17 runtime, and this Tomcat all use it), so a host whose default is
+# 21/25/… still builds and runs exactly what CI tested. (JDK 23+ would also need annotation processing enabled
+# explicitly for Lombok.)
 select_jdk17() {
   local c
   for c in "${JAVA17_HOME:-}" \
            /usr/lib/jvm/java-17-openjdk* /usr/lib/jvm/*temurin-17* /usr/lib/jvm/*zulu*17* \
-           /usr/lib/jvm/*corretto*17* /usr/lib/jvm/*-17-* /usr/lib/jvm/*17* /opt/*jdk-17* /opt/*jdk17*; do
+           /usr/lib/jvm/*corretto*17* /usr/lib/jvm/*-17-* /usr/lib/jvm/*17* /opt/*jdk-17* /opt/*jdk17* "$RUNTIME_DIR/jdk-$JDK17_VER"; do
     [ -n "$c" ] && [ -x "$c/bin/javac" ] || continue
     case "$("$c/bin/javac" -version 2>&1)" in *' 17.'*) printf '%s' "$c"; return 0 ;; esac
   done
   return 1
 }
+# The console is built (and the supervisor run) on one Node line, NODE_VER's major: a host Node on that line is used,
+# anything else (none, the distros' 18, a newer line) gets the pinned download. The host's own Node is never replaced.
+# The supervisor runs it as $SVC_USER, so a Node only root can run (nvm under /root) does not count either. On a fresh
+# host that account does not exist yet, and nobody stands in for it.
+host_node_ok() {
+  local u="$SVC_USER"
+  command -v node >/dev/null && command -v npm >/dev/null || return 1
+  case "$(node -v 2>/dev/null)" in "v${NODE_VER%%.*}."*) ;; *) return 1 ;; esac
+  id -u "$u" >/dev/null 2>&1 || u=nobody
+  ( cd / && setpriv --reuid="$u" --regid="$(id -g "$u")" --init-groups "$(command -v node)" -e '' ) >/dev/null 2>&1
+}
+# fetch_runtime NAME URL SHA256: download URL, check it against the SHA-256 pinned above (never one fetched alongside it),
+# and unpack it as $RUNTIME_DIR/NAME. It is unpacked beside its final place and renamed into it, so NAME exists only once
+# the check passed, and a re-run reuses it.
+fetch_runtime() {
+  local name="$1" url="$2" sha="$3" t got
+  [ -d "$RUNTIME_DIR/$name" ] && { info "$name already in $RUNTIME_DIR"; return 0; }
+  [ -n "$sha" ] || _fail "No pinned Node/JDK download for $(uname -m): install Node ${NODE_VER%%.*} / JDK 17 yourself and re-run."
+  [ ! -L "$RUNTIME_DIR" ] || _fail "Refusing to use $RUNTIME_DIR: it is a symbolic link. Remove it and re-run."
+  { mkdir -p "$RUNTIME_DIR" && chmod 755 "$RUNTIME_DIR" && rm -rf "$RUNTIME_DIR"/.fetch.??????; } \
+    || _fail "Could not prepare $RUNTIME_DIR"   # the rm: what a killed run left behind
+  t=$(mktemp -d "$RUNTIME_DIR/.fetch.XXXXXX") || _fail "Could not create a temporary directory in $RUNTIME_DIR"
+  run "Downloading $name" curl -fsSL --retry 3 "$url" -o "$t/rt.tar.gz"
+  got=$(sha256sum "$t/rt.tar.gz" | awk '{print $1}') || _fail "Could not checksum the $name download"
+  if [ "$got" != "$sha" ]; then
+    rm -rf "$t"; _fail "The $name download does not match its pinned SHA-256"
+  fi
+  mkdir "$t/rt" || _fail "Could not create $t/rt"
+  run "Unpacking $name" tar -xzf "$t/rt.tar.gz" -C "$t/rt" --strip-components=1 --no-same-owner
+  chmod -R a+rX,go-w "$t/rt" || _fail "Could not set permissions on $name"   # umask 077 above; $SVC_USER runs these too
+  mv -T "$t/rt" "$RUNTIME_DIR/$name" || _fail "Could not move $name into $RUNTIME_DIR"
+  rm -rf "$t"
+  ok "$name installed in $RUNTIME_DIR (SHA-256 verified)"
+}
+# Install only what is missing. Asking apt for packages the host already provides another way (Node
+# from nodesource, a JDK under /opt, Postgres from PGDG) is how "held broken packages" conflicts happen
+# on otherwise healthy boxes. Node, and JDK 17 where the distro packages none (Debian 13), come from fetch_runtime.
+PKGS=()
+command -v psql    >/dev/null && command -v pg_ctlcluster >/dev/null || PKGS+=(postgresql)
+command -v mvn     >/dev/null || PKGS+=(maven)
+command -v curl    >/dev/null || PKGS+=(curl)
+command -v python3 >/dev/null || PKGS+=(python3)
+command -v aapt    >/dev/null || PKGS+=(aapt)
+APT_UPDATED=0
+apt_update() {
+  [ "$APT_UPDATED" = 1 ] && return 0
+  # Tolerate an unrelated broken third-party APT source (e.g. a Docker repo on a codename Docker doesn't
+  # publish for → "does not have a Release file") — the native install only needs base Debian packages.
+  run "Refreshing package lists" bash -c "apt-get update -y || echo '(some apt sources failed to refresh — continuing)'"
+  APT_UPDATED=1
+}
+FETCH_JDK17=0
+if ! select_jdk17 >/dev/null; then
+  apt_update
+  # A case, not `| grep -q`: grep's early exit would SIGPIPE apt-cache and fail the pipeline under pipefail.
+  case "$(apt-cache policy openjdk-17-jdk 2>/dev/null)" in *'Candidate: '[0-9]*) PKGS+=(openjdk-17-jdk) ;; *) FETCH_JDK17=1 ;; esac
+fi
+if [ ${#PKGS[@]} -eq 0 ]; then
+  ok "all packaged dependencies already present — nothing to install"
+else
+  apt_update
+  run "$(IFS=,; echo "${PKGS[*]}" | sed 's/,/, /g')" bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y ${PKGS[*]}"
+fi
+# minisign verifies release-manifest signatures for the updater supervisor. Best-effort: without it
+# the supervisor still runs but reports releases as unverified (and never mirrors an APK).
+DEBIAN_FRONTEND=noninteractive apt-get install -y minisign >> "$LOGFILE" 2>&1 || info "minisign unavailable — updater will report releases as unverified"
+if host_node_ok; then
+  ok "Node $(node -v) from this host"
+else
+  NODE_NAME="node-v${NODE_VER}-linux-${NODE_ARCH}"
+  info "no Node ${NODE_VER%%.*} on this host that $SVC_USER can run (found: $(node -v 2>/dev/null || echo none)): using the pinned Node ${NODE_VER}"
+  fetch_runtime "$NODE_NAME" "https://nodejs.org/dist/v${NODE_VER}/${NODE_NAME}.tar.gz" "${NODE_ARCH:+$NODE_SHA}"
+  export PATH="$RUNTIME_DIR/$NODE_NAME/bin:$PATH"
+fi
+if [ "$FETCH_JDK17" = 1 ]; then
+  info "the distro packages no JDK 17: using the pinned Temurin ${JDK17_VER}"
+  fetch_runtime "jdk-${JDK17_VER}" \
+    "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-${JDK17_VER/+/%2B}/OpenJDK17U-jdk_${JDK17_ARCH}_linux_hotspot_${JDK17_VER/+/_}.tar.gz" \
+    "${JDK17_ARCH:+$JDK17_SHA}"
+fi
+
+step "Selecting the Java 17 toolchain"
 JAVA_HOME=$(select_jdk17) || {
   _spin_stop
-  echo "  ${c_red}✗ no JDK 17 found${c_reset} — the server build REQUIRES JDK 17 (Lombok 1.18.20 breaks on JDK 21+)." >&2
+  echo "  ${c_red}✗ no JDK 17 found${c_reset} — the server is built and run on JDK 17 (the supported server JDK)." >&2
   echo "    Install it (apt-get install -y openjdk-17-jdk) or set JAVA17_HOME to a JDK 17 home, then re-run." >&2
   exit 1
 }
@@ -164,16 +615,18 @@ ok "$(javac -version 2>&1) — $JAVA_HOME"
 step "Database"
 # Idempotent: every run generates a fresh DB_PASSWORD, so ALWAYS set the role's password to match — ALTER
 # if the role already exists from a previous run, else CREATE — so ROOT.xml + seeding always authenticate.
-# NB: the password is inlined into the SQL text, so a psql error here could echo the whole statement
-# (password included) into $LOGFILE — acceptable because the log is chmod 600 / owner-only (above).
+# The password reaches psql on stdin as a psql variable (:'pw' quotes it as an SQL literal), never on its command line,
+# which every local user can read (ps, /proc/<pid>/cmdline). A psql error here can still echo the
+# statement (password included) into $LOGFILE, which is owner-only (above).
+role_password_sql() { printf '%s\n' "\\set pw $(_mdm_psql_arg "$DB_PASSWORD")" "$1 USER mdmesh WITH PASSWORD :'pw';"; }
 {
-  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='mdmesh'" | grep -q 1; then
-    sudo -u postgres psql -c "ALTER USER mdmesh WITH PASSWORD '${DB_PASSWORD}';"
+  if as_postgres psql -X -tAc "SELECT 1 FROM pg_roles WHERE rolname='mdmesh'" | grep -q 1; then
+    role_password_sql ALTER | as_postgres psql -X -v ON_ERROR_STOP=1
   else
-    sudo -u postgres psql -c "CREATE USER mdmesh WITH PASSWORD '${DB_PASSWORD}';"
+    role_password_sql CREATE | as_postgres psql -X -v ON_ERROR_STOP=1
   fi
-  sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='mdmesh'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE DATABASE mdmesh OWNER mdmesh;"
+  as_postgres psql -X -tAc "SELECT 1 FROM pg_database WHERE datname='mdmesh'" | grep -q 1 || \
+    as_postgres psql -X -c "CREATE DATABASE mdmesh OWNER mdmesh;"
 } >> "$LOGFILE" 2>&1
 ok "PostgreSQL role + database 'mdmesh' ready"
 
@@ -182,27 +635,56 @@ ok "PostgreSQL role + database 'mdmesh' ready"
 # to KEEPING it: we only deploy new code + run Liquibase migrations (non-destructive). Replacing is opt-in
 # and drops the DB for a clean slate. Override non-interactively with REPLACE_DATA=yes|no.
 q() { PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U mdmesh -d mdmesh -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
+# A function, not `env PGPASSWORD=... psql`: env would carry the password on its command line.
+mdmesh_psql() { PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U mdmesh -d mdmesh "$@"; }
+# shellcheck disable=SC2034  # PSQL is consumed by install/lib/db.sh
+PSQL=(mdmesh_psql)
 SEED=yes
-if [ "$(q "SELECT to_regclass('public.users')")" = "users" ] && [ "$(q "SELECT count(*) FROM users")" != "0" ]; then
-  uc=$(q "SELECT count(*) FROM users"); dc=$(q "SELECT count(*) FROM devices"); dc=${dc:-0}
+DB_STATE=$(mdm_db_state)   # fresh | seeded | inconsistent | unavailable (no schema yet on a new box)
+# "unavailable" on a box that already HAS the schema means we could not read the settings table, not that
+# the install is new. Seeding would DELETE configurations, so stop instead of guessing (a brand-new box has
+# no users table yet and falls through to SEED=yes as before).
+if [ "$DB_STATE" = unavailable ] && [ "$(q "SELECT to_regclass('public.users')")" = "users" ]; then
+  printf '  %s✗ the schema exists but the settings table could not be read — not seeding over an existing install.%s\n' "$c_red" "$c_reset"
+  printf '  %sCheck Postgres connectivity / the settings table, then re-run.%s\n' "$c_yel" "$c_reset"; exit 1
+fi
+if [ "$DB_STATE" = inconsistent ]; then
+  printf '  %s✗ the database has devices but no settings row — refusing to seed (it would delete configurations).%s\n' "$c_red" "$c_reset"
+  printf '  %sRestore a backup or repair the settings table by hand, then re-run.%s\n' "$c_yel" "$c_reset"; exit 1
+fi
+if [ "$DB_STATE" = seeded ]; then
+  # count(*) is a bigint; keep only a plain integer (else "?") so nothing the mdmesh role owns can put control bytes
+  # into the prompt printed to the terminal.
+  n_or_q() { case "$1" in ''|*[!0-9]*) printf '?' ;; *) printf '%s' "$1" ;; esac; }
+  uc=$(n_or_q "$(q "SELECT count(*) FROM users")"); dc=$(n_or_q "$(q "SELECT count(*) FROM devices")")
   REPLACE_DATA="${REPLACE_DATA:-}"
   if [ -z "$REPLACE_DATA" ]; then
     if [ "$ASSUME_YES" = 1 ]; then
       REPLACE_DATA=no   # never destroy data unprompted
     else
       printf '\n  %s%s⚠  Existing MDMesh data found: %s device(s), %s user(s).%s\n' "$c_red" "$c_bold" "$dc" "$uc" "$c_reset"
-      printf '  %sKeep your existing data? Answering "no" ERASES all of it.%s %s[Y/n]%s: ' "$c_red" "$c_reset" "$c_bold" "$c_reset"
-      # Default (Enter) keeps data. Only an explicit no/n erases it.
-      read -r _r; case "$_r" in n|N|no|NO) REPLACE_DATA=yes ;; *) REPLACE_DATA=no ;; esac
+      printf '  What should the installer do with it?\n'
+      printf '    %s[K]eep%s  — deploy new code + run migrations; devices, users and configs untouched %s(default)%s\n' "$c_bold" "$c_reset" "$c_bold" "$c_reset"
+      printf '    %s[E]rase%s — drop the database and start from an empty seed. %sThis cannot be undone.%s\n' "$c_bold" "$c_reset" "$c_red" "$c_reset"
+      printf '  Choice %s[K/e]%s: ' "$c_bold" "$c_reset"
+      read -r _r
+      case "$_r" in
+        e|E|erase|ERASE)
+          # Destructive path needs a second, typed confirmation (same convention as `gh repo delete`).
+          printf '  %sType ERASE to confirm dropping %s device(s) and %s user(s):%s ' "$c_red" "$dc" "$uc" "$c_reset"
+          read -r _c
+          if [ "$_c" = "ERASE" ]; then REPLACE_DATA=yes; else info "Not confirmed — keeping existing data."; REPLACE_DATA=no; fi ;;
+        *) REPLACE_DATA=no ;;
+      esac
     fi
   fi
   if [ "$REPLACE_DATA" = yes ]; then
     info "Replacing the database — dropping $dc device(s), $uc user(s)"
-    "$CATALINA/bin/catalina.sh" stop 15 -force >/dev/null 2>&1 || true   # release DB connections first
+    stop_tomcat   # release DB connections first
     {
-      sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='mdmesh' AND pid<>pg_backend_pid();"
-      sudo -u postgres psql -c "DROP DATABASE mdmesh;"
-      sudo -u postgres psql -c "CREATE DATABASE mdmesh OWNER mdmesh;"
+      as_postgres psql -X -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='mdmesh' AND pid<>pg_backend_pid();"
+      as_postgres psql -X -c "DROP DATABASE mdmesh;"
+      as_postgres psql -X -c "CREATE DATABASE mdmesh OWNER mdmesh;"
     } >> "$LOGFILE" 2>&1
     SEED=yes
   else
@@ -212,8 +694,9 @@ if [ "$(q "SELECT to_regclass('public.users')")" = "users" ] && [ "$(q "SELECT c
 fi
 
 step "Building the server"
+# clean: an upgrade builds in the previous checkout, and classes a release deletes must not stay in target/.
 run "Maven package (JDK 17, ~1-2 min)" bash -c \
-  'cp server/build.properties.example server/build.properties 2>/dev/null || true; mvn -q -B -DskipTests -pl server -am package'
+  'cp server/build.properties.example server/build.properties 2>/dev/null || true; mvn -q -B -DskipTests -pl server -am clean package'
 
 step "Fetching the agent APK from GitHub Releases"
 # The agent APK is a release artifact, not a repo file. Pull the latest release's signed APK (+ manifest)
@@ -221,31 +704,122 @@ step "Fetching the agent APK from GitHub Releases"
 # provisioning QR matches the hosted APK. Anonymous once the repo is public; honours GITHUB_TOKEN if set.
 # Graceful: if there's no release yet (or it's still private/unreachable), the install continues with
 # debug defaults and you host an APK manually — enrollment just needs a matching APK at /files/agent.apk.
-GITHUB_REPO="${GITHUB_REPO:-$(git remote get-url origin 2>/dev/null | sed -E 's#(git@|https?://)[^/:]+[/:]##; s#\.git$##')}"
-AGENT_APK=""
-if [ -n "$GITHUB_REPO" ]; then
-  AUTH=(); [ -n "${GITHUB_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-  jget() { python3 -c 'import sys,json;
-d=json.load(sys.stdin)
-def asset(n): return next((a["browser_download_url"] for a in d.get("assets",[]) if a["name"]==n),"")
-print({"apk":asset("mdmesh-agent.apk"),"manifest":asset("manifest.json")}.get(sys.argv[1],""))' "$1" 2>/dev/null; }
-  REL=$(curl -fsSL "${AUTH[@]}" "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>>"$LOGFILE" || true)
-  APK_URL=$(printf '%s' "$REL" | jget apk); MAN_URL=$(printf '%s' "$REL" | jget manifest)
-  if [ -n "$APK_URL" ] && [ -n "$MAN_URL" ]; then
-    MAN=$(curl -fsSL "${AUTH[@]}" "$MAN_URL" 2>>"$LOGFILE" || true)
-    AGENT_CK=$(printf '%s' "$MAN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["components"]["apk"]["signatureChecksum"])' 2>/dev/null || true)
-    WANT_SHA=$(printf '%s' "$MAN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["components"]["apk"]["sha256"])' 2>/dev/null || true)
-    TMP_APK=$(mktemp)
-    if curl -fsSL "${AUTH[@]}" "$APK_URL" -o "$TMP_APK" 2>>"$LOGFILE" && [ -n "$AGENT_CK" ] \
-       && [ "$(sha256sum "$TMP_APK" | awk '{print $1}')" = "$WANT_SHA" ]; then
-      AGENT_APK="$TMP_APK"
-      export VITE_AGENT_PACKAGE="com.mdmesh.agent" VITE_AGENT_CHECKSUM="$AGENT_CK" VITE_AGENT_APK_URL="/files/agent.apk"
-      ok "release agent APK fetched + sha256-verified (checksum ${AGENT_CK})"
-    else
-      info "Could not fetch/verify the release APK — continuing; host one at /files/agent.apk manually"
-    fi
+# The APK is trusted only through the release's signed manifest, as the supervisor does: manifest.json must verify with
+# minisign against release/minisign.pub before its checksum and sha256 are read, and the APK must match that sha256.
+# Anything less (no signature, a bad one, no minisign, a failed download, a mismatch) is refused, with its own message.
+# GITHUB_REPO and GITHUB_TOKEN (also the updater's settings, written to supervisor.env below) are kept across re-runs, like
+# the ROOT.xml settings: a variable set in the environment wins, even set to "" (GITHUB_TOKEN= removes the token,
+# GITHUB_REPO= goes back to the clone's origin); otherwise the value in the current supervisor.env; otherwise the default
+# (the clone's origin; no token). Erase keeps them as well: they configure this host's updater, not the data.
+# GITHUB_REPO_FROM in that file records where the repo came from: "origin" (the default) is derived from the clone again
+# on every run, so a clone moved to a fork follows it; "setting" (it was passed) is kept until a new value is passed. A
+# file from before GITHUB_REPO_FROM existed counts as "origin" when its repo is the origin's, else as "setting".
+# The file is parsed, never sourced (sup_old_param), and what it holds is checked like a passed value (repo_ok, token_ok):
+# one that fails is ignored, with a note that does not print it.
+# Before v0.3.2 the file was $BASE_DIR/supervisor.env, in $SVC_USER's tree: it is read as that account (svc_cat), and if
+# it cannot read it yet (root-owned, as those versions wrote it; see readable_after_heal), after heal_trees.
+SUP_ENV="$SUP_ENV_DIR/supervisor.env"; SUP_ENV_LEGACY="$BASE_DIR/supervisor.env"
+_repo_in_env=${GITHUB_REPO+x}; _token_in_env=${GITHUB_TOKEN+x}; _env_repo=${GITHUB_REPO-}
+_sup_old=; _sup_old_deferred=0
+if [ -f "$SUP_ENV" ]; then
+  _sup_old=$(head -c 65536 -- "$SUP_ENV") || _fail "Could not read $SUP_ENV"
+elif [ -e "$SUP_ENV_LEGACY" ] || [ -L "$SUP_ENV_LEGACY" ]; then
+  if ! _sup_old=$(svc_cat "$SUP_ENV_LEGACY" 2>>"$LOGFILE"); then
+    _sup_old=
+    if readable_after_heal "$BASE_DIR" supervisor.env; then _sup_old_deferred=1
+    else info "Could not read $SUP_ENV_LEGACY as $SVC_USER (not a regular file?): the updater settings start from their defaults"; fi
+  fi
+fi
+# sup_old_param KEY: KEY's value in _sup_old, as systemd reads an EnvironmentFile: lines starting with # or ; are
+# comments, the last KEY= line wins, and the CR of a CRLF line, whitespace around the key, the "=" and the value, and one
+# pair of matching quotes around the value are dropped. A value that runs on (a quote not closed on its line, or a
+# trailing \) is not followed: the lines it runs over are skipped, never read as KEY= lines of their own, and its first
+# line fails repo_ok/token_ok. (Escapes inside a value are not undone either; they fail those checks too.)
+sup_old_param() {
+  local line k v="" raw q="" cont=0
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    if [ -n "$q" ]; then case "$line" in *"$q"*) q="" ;; esac; continue; fi       # inside an open quote
+    if [ "$cont" = 1 ]; then case "$line" in *\\) ;; *) cont=0 ;; esac; continue; fi   # after a trailing \
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in '#'*|';'*) continue ;; *=*) ;; *) continue ;; esac
+    k=${line%%=*}; k=${k%"${k##*[![:space:]]}"}
+    raw=${line#*=}; raw=${raw#"${raw%%[![:space:]]*}"}; raw=${raw%"${raw##*[![:space:]]}"}
+    case "$raw" in \"*|\'*) case "${raw:1}" in *"${raw:0:1}"*) ;; *) q=${raw:0:1} ;; esac ;; esac
+    if [ -z "$q" ]; then case "$raw" in *\\) cont=1 ;; esac; fi
+    [ "$k" = "$1" ] || continue
+    v=$raw
+    case "$v" in \"*\"|\'*\') v=${v:1:${#v}-2} ;; esac
+  done <<< "$_sup_old"
+  printf '%s' "$v"
+}
+# origin_repo: owner/name of the clone's origin, or empty (no origin, no git, or not a GitHub owner/name).
+origin_repo() {
+  local o
+  o=$(git -C "$REPO" remote get-url origin 2>/dev/null | sed -E 's#^(ssh://)?(git@|https?://)[^/:]+[/:]##; s#/+$##; s#\.git$##' || true)
+  if repo_ok "$o"; then printf '%s' "$o"; fi
+}
+# resolve_sup_settings: GITHUB_REPO, GITHUB_REPO_FROM and GITHUB_TOKEN by the rules above, from _sup_old as it stands.
+resolve_sup_settings() {
+  local stored from
+  _origin=$(origin_repo); GITHUB_REPO=""; GITHUB_REPO_FROM=setting
+  if [ -n "$_repo_in_env" ]; then GITHUB_REPO=$_env_repo
   else
-    info "No published release found for ${GITHUB_REPO} — console uses debug defaults; host /files/agent.apk manually"
+    stored=$(sup_old_param GITHUB_REPO); from=$(sup_old_param GITHUB_REPO_FROM)
+    if [ -n "$stored" ] && ! repo_ok "$stored"; then
+      info "Ignoring the GITHUB_REPO in the existing supervisor.env: it is not owner/name"; stored=
+    fi
+    if [ "$from" = origin ] || { [ "$from" != setting ] && [ "$stored" = "$_origin" ]; }; then stored=; fi
+    GITHUB_REPO=$stored
+  fi
+  [ -n "$GITHUB_REPO" ] || { GITHUB_REPO=$_origin; GITHUB_REPO_FROM=origin; }
+  if [ -z "$_token_in_env" ]; then
+    GITHUB_TOKEN=$(sup_old_param GITHUB_TOKEN)
+    if ! token_ok "$GITHUB_TOKEN"; then
+      info "Ignoring the GITHUB_TOKEN in the existing supervisor.env: it is not a GitHub token (letters, digits and _)"; GITHUB_TOKEN=
+    fi
+  fi
+  return 0
+}
+resolve_sup_settings
+if [ "$_sup_old_deferred" = 1 ] && { [ -z "$_repo_in_env" ] || [ -z "$_token_in_env" ]; }; then
+  info "The existing $SUP_ENV_LEGACY (v0.3.1 or older) is root-owned: its GITHUB_REPO and GITHUB_TOKEN are kept, but read"
+  info "  only once this run has handed the tree back, so this release fetch goes without them (pass them once more if needed)"
+fi
+AGENT_APK=""
+# The manifest, its signature and the APK are fetched into one private directory (mktemp -d). The deploy step removes it
+# once the APK is hosted; this EXIT trap removes it on every other way the run ends (_fail, an error under set -e, a
+# signal). It adds an EXIT trap only: the ERR trap above is unchanged and still reports an abort first.
+AGENT_FETCH_DIR=""
+agent_fetch_cleanup() { if [ -n "$AGENT_FETCH_DIR" ]; then rm -rf -- "$AGENT_FETCH_DIR"; AGENT_FETCH_DIR=""; fi; }
+trap agent_fetch_cleanup EXIT
+if [ -n "$GITHUB_REPO" ]; then
+  # fetch_agent_apk: sets AGENT_APK (and AGENT_CK) when the latest release's APK verifies (install/lib/release.sh);
+  # otherwise says why in one line and leaves AGENT_APK empty. Always returns 0, so set -e still stops the run on
+  # anything else.
+  fetch_agent_apk() {
+    local soft=" — console uses debug defaults; host /files/agent.apk manually"
+    AGENT_CK=""
+    # The ERR trap does not fire inside a function (no set -E), so a failure here must be caught here, or the install
+    # would end without a word.
+    AGENT_FETCH_DIR=$(mktemp -d) || { AGENT_FETCH_DIR=""; info "Could not create a temporary directory for the release files${soft}"; return 0; }
+    if mdm_fetch_release_apk "$GITHUB_REPO" "$REPO/release/minisign.pub" "$AGENT_FETCH_DIR" "$LOGFILE"; then
+      AGENT_CK=$MDM_AGENT_CK; AGENT_APK="$AGENT_FETCH_DIR/agent.apk"
+    else
+      info "${MDM_RELEASE_PROBLEM}${soft}"
+    fi
+    if [ -n "$MDM_RELEASE_NOTE" ]; then
+      printf '  %s!%s %s. The updater uses it too: re-run with GITHUB_TOKEN=<new token>, or GITHUB_TOKEN= to remove it\n' \
+        "$c_yel" "$c_reset" "$MDM_RELEASE_NOTE"
+    fi
+    return 0
+  }
+  fetch_agent_apk
+  if [ -n "$AGENT_APK" ]; then
+    export VITE_AGENT_PACKAGE="com.mdmesh.agent" VITE_AGENT_CHECKSUM="$AGENT_CK" VITE_AGENT_APK_URL="/files/agent.apk"
+    ok "release agent APK fetched: manifest signature verified, sha256 matches (checksum ${AGENT_CK})"
+  else
+    agent_fetch_cleanup
   fi
 else
   info "No GitHub repo detected — skipping release fetch; host /files/agent.apk manually"
@@ -258,23 +832,72 @@ step "Building the admin console"
 run "npm ci + vite build (web/)" bash -c 'cd web && npm ci --no-audit --no-fund && npm run build'
 
 step "Tomcat 9 + app deploy"
+# Stop the previous instance first: dropping a new ROOT.war into a running Tomcat triggers a hot redeploy
+# against the old context parameters (and the DB password we just rotated). The supervisor is stopped too, and then any
+# other $SVC_USER process is killed: from here until the supervisor is started again below, root writes into $CATALINA
+# and $BASE_DIR, which that account owns.
+stop_tomcat
+stop_supervisor
+kill_svc_user
+refuse_svc_user_jobs stopped
+heal_trees
+# What could not be read before the heal (root-owned leftovers of an interrupted run) is read now, the same way.
+if [ "$_old_root_deferred" = 1 ]; then
+  _old_xml=$(svc_cat "$_old_root" 2>>"$LOGFILE") || _fail "$_old_root_unreadable"
+  adopt_old_secrets
+fi
+if [ "$_url_deferred" = 1 ]; then
+  BASE_URL=$(old_root_param base.url)
+  mdm_check_base_url BASE_URL \
+    || _fail "No valid base URL in $_old_root. The server stays down until you re-run with BASE_URL=https://mdm.example.com (your public address) set."
+  info "Keeping the base URL ${BASE_URL} (read from ROOT.xml after handing the tree back)"
+fi
+if [ "$_sup_old_deferred" = 1 ]; then
+  _sup_old=$(svc_cat "$SUP_ENV_LEGACY" 2>>"$LOGFILE") \
+    || { _sup_old=; info "Could not read $SUP_ENV_LEGACY as $SVC_USER: the updater settings start from their defaults"; }
+  resolve_sup_settings
+fi
+if [ "$_port_deferred" = 1 ]; then
+  HTTP_PORT=$(svc_cat "$CATALINA/conf/server.xml" 2>>"$LOGFILE" | connector_port) || true
+  HTTP_PORT=${HTTP_PORT:-8080}
+  check_port
+  info "Keeping HTTP port ${HTTP_PORT} (read from server.xml after handing the tree back)"
+  if [ "$(port_owner)" = foreign ]; then refuse_foreign_port; fi
+fi
 # Install Tomcat if it's missing OR a previous run left it partial/corrupt. Check for the actual launcher
 # script, not just the directory, so a broken /opt/mdmesh-tc self-heals instead of failing at startup.
 # archive.apache.org keeps every release permanently, so the pinned version URL never rots.
+TC_FRESH=0   # 1 when root unpacks Tomcat below (see the server.xml read)
 if [ ! -x "$CATALINA/bin/catalina.sh" ]; then
-  run "Downloading Apache Tomcat ${TOMCAT_VER}" \
-    curl -fsSL --retry 3 "https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VER}/bin/apache-tomcat-${TOMCAT_VER}.tar.gz" -o /tmp/tc.tgz
+  # A fresh private temp file (not a fixed /tmp name) and Apache's published SHA-512; extracted with root's own
+  # ownership and umask, never the archive's.
+  TC_URL="https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VER}/bin/apache-tomcat-${TOMCAT_VER}.tar.gz"
+  TC_TGZ=$(mktemp)
+  run "Downloading Apache Tomcat ${TOMCAT_VER}" curl -fsSL --retry 3 "$TC_URL" -o "$TC_TGZ"
+  TC_SHA=$(curl -fsSL --retry 3 "$TC_URL.sha512" | awk 'NR == 1 {print $1}') || TC_SHA=   # no early exit: SIGPIPE under pipefail
+  if [ -z "$TC_SHA" ] || [ "$(sha512sum "$TC_TGZ" | awk '{print $1}')" != "$TC_SHA" ]; then
+    rm -f "$TC_TGZ"; _fail "Tomcat download does not match Apache's published SHA-512"
+  fi
   rm -rf "$CATALINA"; mkdir -p "$CATALINA"
-  tar xzf /tmp/tc.tgz -C "$CATALINA" --strip-components=1
+  tar xzf "$TC_TGZ" -C "$CATALINA" --strip-components=1 --no-same-owner --no-same-permissions
+  rm -f "$TC_TGZ"
   [ -x "$CATALINA/bin/catalina.sh" ] || _fail "Tomcat extract (catalina.sh missing after unpack)"
+  TC_FRESH=1
   ok "Apache Tomcat ${TOMCAT_VER} installed at $CATALINA"
 else
   info "Apache Tomcat already present at $CATALINA"
 fi
 # Point Tomcat's HTTP connector at the chosen port. Idempotent across re-runs: rewrite whatever numeric
 # port currently sits on the HTTP/1.1 connector (leaves the shutdown/AJP ports untouched).
-sed -i -E "s#(<Connector port=\")[0-9]+(\" protocol=\"HTTP/1.1\")#\1${HTTP_PORT}\2#" "$CATALINA/conf/server.xml"
+# The file is read first, as $SVC_USER (svc_cat: root never opens a file in that account's tree), unless root unpacked
+# this Tomcat just above (then the file is root's own, mode 600, and no $SVC_USER process has run since). tc_write then
+# refuses a link there and replaces the file without following one.
+if [ "$TC_FRESH" = 1 ]; then _server_xml=$(cat -- "$CATALINA/conf/server.xml")
+else _server_xml=$(svc_cat "$CATALINA/conf/server.xml" 2>>"$LOGFILE"); fi \
+  || _fail "Could not read $CATALINA/conf/server.xml as $SVC_USER: if it is a symbolic link, remove it; if root owns it (a run that stopped before handing the tree over), run chown -R $SVC_USER:$SVC_USER $CATALINA. Then re-run."
+tc_write conf/server.xml sed -E "s#(<Connector port=\")[0-9]+(\" protocol=\"HTTP/1.1\")#\1${HTTP_PORT}\2#" <<< "$_server_xml"
 info "HTTP port set to ${HTTP_PORT}"
+tc_guard webapps   # the glob below would otherwise empty a linked directory's target as root
 rm -rf "$CATALINA"/webapps/*
 # Deploy the server as an EXPLODED webapp (not ROOT.war) and overlay the built SPA into it, so a single
 # Tomcat serves the console at / and the API at /rest on one origin. Exploding ourselves (no ROOT.war
@@ -283,16 +906,34 @@ mkdir -p "$CATALINA/webapps/ROOT"
 ( cd "$CATALINA/webapps/ROOT" && "$JAVA_HOME/bin/jar" -xf "$REPO/server/target/launcher.war" )
 cp -a "$REPO"/web/dist/. "$CATALINA/webapps/ROOT/"   # index.html + assets at / (server maps /rest,/files,/agent)
 # SPA fallback (verified on Tomcat 9.0.89): !-f serves real files (assets) as-is; the negative lookahead
-# leaves the API paths (/rest,/files,/agent) alone; everything else → index.html so client-side routes
-# survive a reload. Paired with the RewriteValve declared in ROOT.xml above.
-printf 'RewriteCond %%{REQUEST_URI} !-f\nRewriteRule ^/(?!rest|files|agent|update)(.*)$ /index.html\n' \
-  > "$CATALINA/webapps/ROOT/WEB-INF/rewrite.config"
-mkdir -p "$BASE_DIR/files" "$BASE_DIR/plugins" "$CATALINA/conf/Catalina/localhost"
-cp install/log4j_template.xml "$BASE_DIR/log4j-mdmesh.xml"
-cp -r install/emails "$BASE_DIR/" 2>/dev/null || true
+# leaves the API paths (/rest,/files,/agent,/update) alone; everything else → index.html so client-side routes
+# survive a reload. /healthz and anything below it is left alone too, so it 404s here instead of returning the
+# console's 200: native has no health route (that's Docker's edge), and a monitor pointed at it must see a failure.
+# Paired with the RewriteValve declared in ROOT.xml above.
+tc_write webapps/ROOT/WEB-INF/rewrite.config \
+  printf 'RewriteCond %%{REQUEST_URI} !-f\nRewriteRule ^/(?!rest|files|agent|update|healthz(?:/|$))(.*)$ /index.html\n'
+# $BASE_DIR is the service user's tree too: every root write there goes through base_guard/base_write (see tc_guard).
+base_guard files; base_guard plugins
+mkdir -p "$BASE_DIR/files" "$BASE_DIR/plugins"   # tc_write creates conf/Catalina/localhost after checking for links
+# The email templates, one guarded write per file: a link planted anywhere under emails/ stops the install.
+while IFS= read -r -d '' _email; do
+  base_write "${_email#"$REPO/install/"}" cat "$_email"
+done < <(find "$REPO/install/emails" -type f -print0)
 # Host the release agent APK the QR points at (/files/agent.apk), if we fetched one above.
-[ -n "$AGENT_APK" ] && { cp "$AGENT_APK" "$BASE_DIR/files/agent.apk"; ok "agent APK hosted at /files/agent.apk"; }
-cat > "$CATALINA/conf/Catalina/localhost/ROOT.xml" <<XML
+[ -n "$AGENT_APK" ] && { base_write files/agent.apk cat "$AGENT_APK"; ok "agent APK hosted at /files/agent.apk"; }
+agent_fetch_cleanup   # the fetched release files are no longer needed (the EXIT trap covers every other path)
+# Headwind launcher device routes: off unless 1, kept across re-runs like the settings below.
+X_LEGACY_DEVICE_API=$(root_param LEGACY_DEVICE_API legacy.device.api 0)
+# SMTP (password-recovery email): the Docker .env's variables. Read here, after the deferred ROOT.xml read above.
+X_SMTP_HOST=$(root_param SMTP_HOST smtp.host "")
+X_SMTP_PORT=$(root_param SMTP_PORT smtp.port 25)
+X_SMTP_SSL=$(root_param SMTP_SSL smtp.ssl false)
+X_SMTP_STARTTLS=$(root_param SMTP_STARTTLS smtp.starttls false)
+X_SMTP_USERNAME=$(root_param SMTP_USERNAME smtp.username "")
+X_SMTP_PASSWORD=$(root_param SMTP_PASSWORD smtp.password "")
+X_SMTP_FROM=$(root_param SMTP_FROM smtp.from "mdm@localhost")
+# ROOT.xml carries the DB password, hash.secret and jwt.secretkey: tc_write makes it mode 600.
+tc_write conf/Catalina/localhost/ROOT.xml cat <<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <Context>
     <!-- SPA fallback: serve index.html for client-side routes so a reload on /devices etc. works.
@@ -307,13 +948,14 @@ cat > "$CATALINA/conf/Catalina/localhost/ROOT.xml" <<XML
     <Parameter name="base.url"        value="${BASE_URL}"/>
     <Parameter name="usage.scenario"    value="private"/>
     <Parameter name="secure.enrollment" value="0"/>
+    <Parameter name="legacy.device.api" value="${X_LEGACY_DEVICE_API}"/>
     <Parameter name="hash.secret"       value="${HASH_SECRET}"/>
+    <Parameter name="jwt.secretkey"     value="${JWT_SECRET}"/>
     <Parameter name="plugins.files.directory" value="${BASE_DIR}/plugins"/>
     <Parameter name="plugin.devicelog.persistence.config.class" value="com.hmdm.plugins.devicelog.persistence.postgres.DeviceLogPostgresPersistenceConfiguration"/>
     <Parameter name="role.orgadmin.id" value="2"/>
     <Parameter name="swagger.base.path" value="/rest"/>
     <Parameter name="initialization.completion.signal.file" value="${BASE_DIR}/initialized.txt"/>
-    <Parameter name="log4j.config" value="file://${BASE_DIR}/log4j-mdmesh.xml"/>
     <Parameter name="aapt.command" value="aapt"/>
     <Parameter name="mqtt.server.uri" value=""/>
     <Parameter name="mqtt.auth" value="0"/>
@@ -321,14 +963,49 @@ cat > "$CATALINA/conf/Catalina/localhost/ROOT.xml" <<XML
     <!-- Loopback updater supervisor; /update/* is passed through by UpdateProxyServlet so the
          console's Updates + staged-rollout views are same-origin (no proxy config needed). -->
     <Parameter name="supervisor.base" value="http://127.0.0.1:9000"/>
-    <!-- TODO(parity): the Docker stack wires SMTP via env (smtp.host/port/ssl/starttls/username/
-         password/from — see docker/entrypoint.sh); this installer writes no smtp.* Parameters yet,
-         so password-reset emails stay disabled on native installs. Add them when SMTP is needed. -->
+    <!-- SMTP (password recovery): env SMTP_HOST/PORT/SSL/STARTTLS/USERNAME/PASSWORD/FROM, as in the Docker .env.
+         Re-runs keep these values unless the variable is set. An empty smtp.host turns email off. -->
+    <Parameter name="smtp.host" value="${X_SMTP_HOST}"/>
+    <Parameter name="smtp.port" value="${X_SMTP_PORT}"/>
+    <Parameter name="smtp.ssl" value="${X_SMTP_SSL}"/>
+    <Parameter name="smtp.starttls" value="${X_SMTP_STARTTLS}"/>
+    <Parameter name="smtp.username" value="${X_SMTP_USERNAME}"/>
+    <Parameter name="smtp.password" value="${X_SMTP_PASSWORD}"/>
+    <Parameter name="smtp.from" value="${X_SMTP_FROM}"/>
+    <Parameter name="email.recovery.subj" value="${BASE_DIR}/emails/_LANGUAGE_/recovery_subj.txt"/>
+    <Parameter name="email.recovery.body" value="${BASE_DIR}/emails/_LANGUAGE_/recovery_body.txt"/>
 </Context>
 XML
-# ROOT.xml carries the DB password + hash.secret; umask should already yield 0600, but be explicit.
-chmod 600 "$CATALINA/conf/Catalina/localhost/ROOT.xml"
-ok "server + console deployed (console at /, API at /rest); ROOT.xml written"
+# Tomcat runs unprivileged (like the Docker image). Create the service account and hand it the trees it
+# must write: the whole Tomcat base (logs/work/temp/conf/webapps) and the app dir (uploads, plugins, marker).
+if ! id -u "$SVC_USER" >/dev/null 2>&1; then
+  useradd --system --home-dir "$BASE_DIR" --shell /usr/sbin/nologin "$SVC_USER"
+  info "created service user $SVC_USER"
+fi
+# chown -R follows no links, but it would chown a hard link's target: relies on fs.protected_hardlinks=1 (the default).
+chown -R "$SVC_USER:$SVC_USER" "$CATALINA" "$BASE_DIR"
+ok "server + console deployed (console at /, API at /rest); ROOT.xml written; owned by $SVC_USER"
+
+if [ "$SEED" = no ]; then
+  step "Backing up the database before upgrading"
+  # Liquibase migrations run against live data on the next start; keep a restorable dump first.
+  BK_DIR="$BASE_DIR/backups"; base_guard backups; mkdir -p "$BK_DIR"; chmod 700 "$BK_DIR"
+  BK="$BK_DIR/mdmesh-pre-upgrade-$(date +%Y%m%d-%H%M%S).dump"
+  # Dumped into a fresh mktemp file that is renamed over $BK (mv -fT replaces a link planted at that name instead of
+  # writing through it; mktemp already made it mode 600). Temp dumps a killed run left behind are removed first, by
+  # their own .mdmesh-tmp. names only (as in write_under).
+  rm -f "$BK_DIR"/.mdmesh-pre-upgrade-*.dump.mdmesh-tmp.??????
+  _bk_tmp=$(mktemp "$BK_DIR/.${BK##*/}.mdmesh-tmp.XXXXXX")
+  # Dumped as the mdmesh role, not as the postgres superuser (as_mdmesh_role in lib/runas.sh says why); root opens the
+  # output file (a root-owned mktemp file).
+  if as_mdmesh_role "$DB_PASSWORD" pg_dump -Fc > "$_bk_tmp" 2>>"$LOGFILE" && mv -fT "$_bk_tmp" "$BK"; then
+    ok "pg_dump written: $BK"
+    printf '    '; mdm_restore_hint "$BK"
+  else
+    rm -f "$_bk_tmp"
+    printf '  %s✗ pg_dump failed — not upgrading without a backup. See %s%s\n' "$c_red" "$LOGFILE" "$c_reset"; exit 1
+  fi
+fi
 
 step "Updater supervisor (release polling + verified agent-APK mirror)"
 # The same supervisor the Docker stack runs, as a systemd unit on loopback :9000. It polls GitHub
@@ -336,18 +1013,37 @@ step "Updater supervisor (release polling + verified agent-APK mirror)"
 # and powers Settings→Updates + staged agent rollouts in the console (via the /update/* passthrough
 # servlet). APPLY_SUPPORTED=0: native installs update server/console by re-running this installer,
 # so the self-apply/rollback routes are disabled — the console shows the manual steps instead.
+# It runs as $SVC_USER, like Tomcat: it has no job that needs root here, and its code and state live in $SVC_USER's
+# tree. So $SUP_DIR is handed to $SVC_USER after the writes below (on a fresh install base_write creates it as root;
+# on an upgrade it may hold root-owned apk/, auto.json or recovery.token from when the supervisor ran as root).
 SUP_DIR="$BASE_DIR/supervisor"
-mkdir -p "$SUP_DIR"
-cp "$REPO"/supervisor/server.js "$REPO"/supervisor/lib.js "$REPO"/supervisor/recovery.html "$SUP_DIR/"
-cp "$REPO"/release/minisign.pub "$SUP_DIR/minisign.pub"
+for _f in server.js lib.js recovery.html; do base_write "supervisor/$_f" cat "$REPO/supervisor/$_f"; done
+base_write supervisor/minisign.pub cat "$REPO/release/minisign.pub"
+# chown -R follows no links, but it would chown a hard link's target: relies on fs.protected_hardlinks=1 (the default).
+chown -R "$SVC_USER:$SVC_USER" "$SUP_DIR"
 # The running version: the checkout's latest release tag (source installs track the repo). The
-# supervisor compares it against GitHub's latest to decide "update available".
-CURRENT_VERSION=$(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
-cat > "$BASE_DIR/supervisor.env" <<ENV
+# supervisor compares it against GitHub's latest to decide "update available". Same rule as setup.sh
+# (install/lib/version.sh).
+CURRENT_VERSION=$(mdm_repo_version "$REPO")
+# Settings go to $SUP_ENV_DIR (root-owned; see its definition). Versions before v0.3.2 kept them in $SUP_ENV_LEGACY, which
+# is removed once the new file is in place (so a run killed in between still finds the settings in one of them).
+# GITHUB_REPO / GITHUB_TOKEN: settled in the release-fetch step above. Never print the token itself.
+if [ -z "$_token_in_env" ] && [ -n "$GITHUB_TOKEN" ]; then info "Keeping the GitHub token from the existing settings (GITHUB_TOKEN= removes it)"; fi
+if [ "$GITHUB_REPO_FROM" = setting ] && [ -n "$_origin" ] && [ "${GITHUB_REPO,,}" != "${_origin,,}" ]; then   # GitHub ignores case
+  # Worth seeing: release/minisign.pub in this clone must be the key that repo signs its releases with.
+  printf '  %s!%s Updater repository: %s%s%s (the GITHUB_REPO setting; this clone'"'"'s origin is %s: GITHUB_REPO= follows the origin)\n' \
+    "$c_yel" "$c_reset" "$c_bold" "$GITHUB_REPO" "$c_reset" "$_origin"
+else
+  _from_txt="the clone's origin"; [ "$GITHUB_REPO_FROM" = origin ] || _from_txt="the GITHUB_REPO setting"
+  info "Updater repository: ${GITHUB_REPO:-none (the clone has no GitHub origin; set GITHUB_REPO=owner/name)}${GITHUB_REPO:+ ($_from_txt)}"
+fi
+write_under "$SUP_ENV_DIR" supervisor.env cat <<ENV
 SUPERVISOR_PORT=9000
 SUPERVISOR_BIND=127.0.0.1
 GITHUB_REPO=${GITHUB_REPO}
-GITHUB_TOKEN=${GITHUB_TOKEN:-}
+# origin: GITHUB_REPO is the clone's origin, derived again on every run; setting: it was passed, and is kept.
+GITHUB_REPO_FROM=${GITHUB_REPO_FROM}
+GITHUB_TOKEN=${GITHUB_TOKEN}
 UPDATE_CHANNEL=stable
 POLL_INTERVAL_HOURS=6
 CURRENT_VERSION=${CURRENT_VERSION:-0.0.0}
@@ -359,9 +1055,14 @@ PUBLISH_APK_TO=${BASE_DIR}/files/agent.apk
 SERVER_BASE=http://127.0.0.1:${HTTP_PORT}
 APPLY_SUPPORTED=0
 ENV
-chmod 600 "$BASE_DIR/supervisor.env"
+rm -f "$SUP_ENV_LEGACY"
+NODE_BIN=$(command -v node)
+# Node installed under a private home (nvm in /root, say) is not executable by $SVC_USER, and the unit would only
+# restart-loop quietly (systemctl restart still reports success for Type=simple), so say so here.
+( cd / && setpriv --reuid="$SVC_USER" --regid="$SVC_USER" --init-groups "$NODE_BIN" -e '' ) >> "$LOGFILE" 2>&1 \
+  || info "the $SVC_USER user cannot run $NODE_BIN, so the supervisor will not start: install Node system-wide and re-run"
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  cat > /etc/systemd/system/mdmesh-supervisor.service <<UNIT
+  cat > "/etc/systemd/system/${SUP_UNIT}.service" <<UNIT
 [Unit]
 Description=MDMesh updater supervisor (release polling + verified agent-APK mirror)
 After=network-online.target
@@ -369,8 +1070,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=${BASE_DIR}/supervisor.env
-ExecStart=$(command -v node) ${SUP_DIR}/server.js
+User=${SVC_USER}
+Group=${SVC_USER}
+EnvironmentFile=${SUP_ENV_DIR}/supervisor.env
+ExecStart=${NODE_BIN} ${SUP_DIR}/server.js
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -384,47 +1087,82 @@ UNIT
   # enable + RESTART (not enable --now, which is a no-op on an already-running unit): re-runs
   # rewrite supervisor.env — notably CURRENT_VERSION — and a stale process would keep reporting
   # the pre-upgrade version, leaving the console's "update available" banner stuck forever.
-  systemctl enable mdmesh-supervisor >> "$LOGFILE" 2>&1
-  systemctl restart mdmesh-supervisor >> "$LOGFILE" 2>&1 \
-    && ok "supervisor running v${CURRENT_VERSION:-0.0.0} (systemd unit mdmesh-supervisor, loopback :9000)" \
-    || info "supervisor unit failed to start — check: journalctl -u mdmesh-supervisor"
+  systemctl enable "$SUP_UNIT" >> "$LOGFILE" 2>&1
+  systemctl restart "$SUP_UNIT" >> "$LOGFILE" 2>&1 \
+    && ok "supervisor running v${CURRENT_VERSION:-0.0.0} as $SVC_USER (systemd unit ${SUP_UNIT}, loopback :9000)" \
+    || info "supervisor unit failed to start — check: journalctl -u ${SUP_UNIT}"
 else
-  info "no systemd — start the supervisor manually:"
-  info "  (set -a; . ${BASE_DIR}/supervisor.env; node ${SUP_DIR}/server.js &)"
+  # No ready-made command: one that sources supervisor.env would have root's shell evaluate that file.
+  info "no systemd — start the supervisor yourself, as $SVC_USER (never as root): $NODE_BIN ${SUP_DIR}/server.js, with the"
+  info "  KEY=VALUE settings of ${SUP_ENV_DIR}/supervisor.env in its environment"
 fi
 
 step "Starting the server"
 # Runs on the same pinned JDK 17 (JAVA_HOME exported above), matching the Docker tomcat:9.0-jdk17 image.
 export CATALINA_OPTS="--add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.text=ALL-UNNAMED --add-opens java.desktop/java.awt.font=ALL-UNNAMED"
-# Stop any instance left from a previous run so the freshly written ROOT.xml (new DB password) is loaded.
-"$CATALINA/bin/catalina.sh" stop 15 -force >/dev/null 2>&1 || true
-sleep 1  # let our just-stopped instance release the listen socket
-# Preflight: nothing else may hold the chosen port. We stopped our OWN Tomcat above, so any listener now
-# is foreign (commonly a leftover Headwind/hmdm Tomcat). If we don't catch it, our Tomcat loses the bind,
-# dies quietly, and the old server answers every request with a confusing 404 — fail clearly instead.
-port_holder() {
-  if command -v ss >/dev/null 2>&1; then ss -ltnp 2>/dev/null | awk -v p=":$HTTP_PORT$" '$4 ~ p {print; exit}'
-  elif command -v lsof >/dev/null 2>&1; then lsof -iTCP:"$HTTP_PORT" -sTCP:LISTEN -nP 2>/dev/null | awk 'NR==2{print; exit}'; fi
-}
-holder=$(port_holder)
-if [ -n "$holder" ]; then
-  printf '  %s✗ port %s is already in use%s by another server:\n' "$c_red" "$HTTP_PORT" "$c_reset"
-  printf '    %s%s%s\n' "$c_dim" "$holder" "$c_reset"
-  printf '  Likely a leftover Tomcat from a previous install. Stop it (or pick another port), then re-run:\n'
-  printf '    %ssudo fuser -k %s/tcp%s   (or kill the pid shown above)\n' "$c_dim" "$HTTP_PORT" "$c_reset"
-  exit 1
-fi
-"$CATALINA/bin/catalina.sh" start >> "$LOGFILE" 2>&1
-ok "Tomcat started"
+# Port check (the preflight above already rejected foreign holders; this catches anything that bound since).
+case "$(port_owner)" in
+  unit)   info "port ${HTTP_PORT} is held by our own ${SVC_UNIT} unit — restarting it"; stop_tomcat ;;
+  legacy) info "port ${HTTP_PORT} is held by a Tomcat from a previous install run — stopping it"; stop_tomcat ;;
+esac
+[ "$(port_owner)" = free ] || refuse_foreign_port
+rm -f "$BASE_DIR/initialized.txt"   # Initializer only writes the completion marker when it is absent
+if have_systemd; then
+  cat > "/etc/systemd/system/${SVC_UNIT}.service" <<UNIT
+[Unit]
+Description=MDMesh server (Tomcat 9)
+After=network-online.target postgresql.service
+Wants=network-online.target
 
-# Gate on the actual schema, not a marker file: the seed needs the `users` table, which Liquibase creates
-# on first boot. Polling for it means we never seed an empty DB and we surface the log if it never appears.
-CATALINA_LOG="$CATALINA/logs/catalina.out"
+[Service]
+Type=simple
+User=${SVC_USER}
+Group=${SVC_USER}
+Environment=JAVA_HOME=${JAVA_HOME}
+Environment=CATALINA_HOME=${CATALINA}
+Environment=CATALINA_BASE=${CATALINA}
+Environment=CATALINA_PID=${CATALINA}/tomcat.pid
+Environment="CATALINA_OPTS=${CATALINA_OPTS}"
+ExecStart=${CATALINA}/bin/catalina.sh run
+SuccessExitStatus=143
+TimeoutStopSec=45
+KillMode=mixed
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=${CATALINA} ${BASE_DIR}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload >> "$LOGFILE" 2>&1
+  systemctl enable "$SVC_UNIT" >> "$LOGFILE" 2>&1
+  systemctl restart "$SVC_UNIT" >> "$LOGFILE" 2>&1 || _fail "systemctl restart ${SVC_UNIT} (see: journalctl -u ${SVC_UNIT})"
+  ok "Tomcat started as $SVC_USER (systemd unit ${SVC_UNIT}; enabled at boot)"
+else
+  # No systemd (container/chroot): fall back to catalina.sh under the service user.
+  as_svc_user "$CATALINA/bin/catalina.sh" start >> "$LOGFILE" 2>&1
+  ok "Tomcat started as $SVC_USER (no systemd — not supervised)"
+fi
+
+# Readiness = the server's own completion signal. Initializer writes $BASE_DIR/initialized.txt only after
+# the Guice injector — every Liquibase module, plugins included — has finished, and only if the file is
+# absent, so we delete the previous run's marker before starting Tomcat and wait for a fresh one. Waiting
+# on the `users` table alone was a race: the main change log creates it early while plugin change logs
+# (e.g. the `plugins` table the seed updates) are still running. The users check stays as a sanity bound.
+# Under the systemd unit Tomcat's stdout goes to the journal (there is no catalina.out); read the latest line
+# from whichever exists so the live status line below has something to show.
+last_log_line() {
+  if have_systemd && systemctl is-active --quiet "$SVC_UNIT" 2>/dev/null; then journalctl -u "$SVC_UNIT" -n 1 -o cat --no-pager 2>/dev/null
+  else as_svc_user tail -n 1 -- "$CATALINA/logs/catalina.out" 2>/dev/null; fi   # $SVC_USER's tree: never read as root
+}
+INIT_MARKER="$BASE_DIR/initialized.txt"
 schema_ready() {
+  [ -f "$INIT_MARKER" ] || return 1
   PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U mdmesh -d mdmesh -tAc "SELECT to_regclass('public.users')" 2>/dev/null | grep -q '^users$'
 }
-# Wait up to ~5 min for Liquibase to build the schema. On a TTY, show the latest catalina.out line live
-# so you can watch migrations apply; poll the DB for the users table (authoritative, not a marker file).
+# Wait up to ~5 min for first boot (Liquibase) to complete. On a TTY, show the latest Tomcat log line live.
 _migrate_wait() {
   local frames='⣾⣽⣻⢿⡿⣟⣯⣷' fi=0 cols width last clip i
   if [ "$TTY" != 1 ]; then
@@ -436,7 +1174,7 @@ _migrate_wait() {
   width=$(( cols - 30 )); [ "$width" -ge 12 ] || width=12
   for i in $(seq 1 150); do
     schema_ready && { printf '\r\033[K'; return 0; }
-    last=$(tail -n 1 "$CATALINA_LOG" 2>/dev/null | tr -d '\r'); clip=${last:0:$width}
+    last=$(last_log_line | tr -d '\r'); clip=${last:0:$width}
     fi=$(( (fi + 1) % 8 ))
     printf '\r\033[K  %s%s%s migrating database %s%s%s' "$c_cyn" "${frames:$fi:1}" "$c_reset" "$c_dim" "$clip" "$c_reset"
     sleep 2
@@ -444,23 +1182,32 @@ _migrate_wait() {
   printf '\r\033[K'; return 1
 }
 if ! _migrate_wait; then
-  printf '  %s✗ database schema was not built within 5 minutes (users table missing)%s\n' "$c_red" "$c_reset"
-  printf '  %sLiquibase or server startup likely failed — last lines of %s:%s\n' "$c_yel" "$CATALINA_LOG" "$c_reset"
-  hr; tail -n 30 "$CATALINA_LOG" 2>/dev/null | sed "s/^/    ${c_dim}/;s/$/${c_reset}/" || echo "    (no log at $CATALINA_LOG)"; hr
+  printf '  %s✗ the server did not finish initializing within 5 minutes%s\n' "$c_red" "$c_reset"
+  printf '  %sLiquibase or server startup likely failed — last Tomcat log lines:%s\n' "$c_yel" "$c_reset"
+  hr
+  if unit_installed "$SVC_UNIT"; then journalctl -u "$SVC_UNIT" -n 30 -o cat --no-pager 2>/dev/null
+  else as_svc_user tail -n 30 -- "$CATALINA/logs/catalina.out" 2>/dev/null; fi | sed "s/^/    ${c_dim}/;s/$/${c_reset}/"
+  printf '    %s(full logs: journalctl -u %s  /  %s/logs/)%s\n' "$c_dim" "$SVC_UNIT" "$CATALINA" "$c_reset"; hr
   exit 1
+fi
+# The marker carries "OK" or the initialization error text — refuse to seed on an errored boot. It is read as $SVC_USER
+# (svc_cat): $BASE_DIR is that account's tree, and root would print any root-only file a link planted there points at.
+if ! grep -q '^OK' < <(svc_cat "$INIT_MARKER" 2>/dev/null); then
+  printf '  %s✗ the server reported an initialization error:%s\n' "$c_red" "$c_reset"
+  hr; head -c 2000 < <(svc_cat "$INIT_MARKER" 2>/dev/null) | sed "s/^/    ${c_dim}/;s/$/${c_reset}/"; echo; hr; exit 1
 fi
 ok "database schema ready"
 
 if [ "$SEED" = yes ]; then
   step "Seeding settings + admin account"
   HOST=$(printf '%s' "$BASE_URL" | sed -E 's#https?://##; s#/.*##')
-  {
-    PGPASSWORD="$DB_PASSWORD" sed "s/_ADMIN_EMAIL_/admin@${HOST}/g" install/sql/hmdm_init.en.sql \
-      | PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U mdmesh -d mdmesh || echo "(seed warnings ok if already seeded)"
-    PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U mdmesh -d mdmesh -c \
-      "UPDATE users SET password='$(pwhash "$ADMIN_PASSWORD")', passwordreset=true, passwordresettoken='${RESET_TOKEN}' WHERE login='admin';"
-  } >> "$LOGFILE" 2>&1
-  ok "admin account seeded"
+  # mdm_seed is strict and checks its own postcondition; a half-seed must never look like success.
+  if mdm_seed "admin@${HOST}" install/sql/hmdm_init.en.sql "$ADMIN_PASSWORD" "$RESET_TOKEN" 2>>"$LOGFILE"; then
+    ok "admin account seeded"
+  else
+    printf '  %s✗ seeding failed — the install is NOT usable yet. Details: %s%s\n' "$c_red" "$LOGFILE" "$c_reset"
+    tail -n 15 "$LOGFILE" | sed "s/^/    ${c_dim}/;s/$/${c_reset}/"; exit 1
+  fi
 else
   step "Preserving existing data"
   info "Skipped seeding — your configurations, devices and admin login are untouched"
@@ -470,8 +1217,20 @@ fi
 # EVERY install/upgrade, deliberately OUTSIDE the seed gate so upgrades of older installs get them
 # too: the enrollment-settings fix (createnewdevices + a default configuration, without which every
 # /agent/v1/enroll fails) and the aux-Headwind-app scrub. Idempotent; no-op on an empty database.
-PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U mdmesh -d mdmesh -f install/sql/post_seed.sql >> "$LOGFILE" 2>&1
-ok "post-seed repairs applied (enrollment settings + aux-app scrub)"
+if mdm_post_seed install/sql/post_seed.sql 2>>"$LOGFILE"; then
+  ok "post-seed repairs applied (enrollment settings + aux-app scrub)"
+else
+  printf '  %s✗ post-seed repairs failed — device enrollment would not work. Details: %s%s\n' "$c_red" "$LOGFILE" "$c_reset"
+  tail -n 15 "$LOGFILE" | sed "s/^/    ${c_dim}/;s/$/${c_reset}/"; exit 1
+fi
+
+# Runtimes an earlier run fetched that this one no longer uses (an older pin, or the host now has its own).
+for _rt in "$RUNTIME_DIR"/node-v* "$RUNTIME_DIR"/jdk-*; do
+  [ -d "$_rt" ] || continue
+  case "$_rt" in "$JAVA_HOME"|"${NODE_BIN%/bin/node}") continue ;; esac
+  rm -rf "$_rt"; info "removed the unused runtime $_rt"
+done
+rm -rf "$RUNTIME_DIR"/.fetch.??????   # a failed download's leftovers
 
 trap - ERR
 printf '\n  %s%s✓ MDMesh installed (native)%s\n\n' "$c_grn" "$c_bold" "$c_reset"
@@ -487,5 +1246,5 @@ printf '  %sTomcat%s         %s (serving on :%s — front it with your TLS rever
 printf '  %sLocal URL%s      http://localhost:%s/\n' "$c_dim" "$c_reset" "$HTTP_PORT"
 printf '  %sUpdater%s        Settings -> Updates in the console (supervisor on loopback :9000; recovery page: curl 127.0.0.1:9000)\n' "$c_dim" "$c_reset"
 printf '  %sWebSockets%s     your TLS proxy MUST forward WebSocket upgrades for /agent/ws (instant commands; otherwise ~10 min polling)\n' "$c_dim" "$c_reset"
-printf '\n  %sNotes: add a systemd unit to keep Tomcat running.%s\n' "$c_dim" "$c_reset"
+printf '\n  %sService: systemctl status %s   ·   logs: journalctl -u %s -f  /  %s/logs/%s\n' "$c_dim" "$SVC_UNIT" "$SVC_UNIT" "$CATALINA" "$c_reset"
 printf '  %sInstall log: %s%s\n\n' "$c_dim" "$LOGFILE" "$c_reset"

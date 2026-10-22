@@ -26,6 +26,7 @@ import com.google.inject.Singleton;
 import com.hmdm.persistence.domain.AgentCommand;
 import com.hmdm.persistence.domain.DeviceEvent;
 import com.hmdm.persistence.domain.DeviceState;
+import com.hmdm.persistence.domain.DeviceSyncRow;
 import com.hmdm.persistence.mapper.AgentCommandMapper;
 import com.hmdm.persistence.mapper.AgentDeviceMapper;
 import com.hmdm.persistence.mapper.DeviceEventMapper;
@@ -62,6 +63,11 @@ public class AgentCommandDAO {
         return mapper.listPending(deviceNumber);
     }
 
+    /** True if the device has any pending command: the same rows as {@link #listPending}, but only checks existence. */
+    public boolean hasPending(String deviceNumber) {
+        return mapper.hasPending(deviceNumber);
+    }
+
     /**
      * Record a result status + detail + the completion timestamp (epoch millis). Ownership-scoped:
      * the row is only touched when it belongs to {@code deviceNumber}, and a genuinely terminal
@@ -87,6 +93,14 @@ public class AgentCommandDAO {
         mapper.expireStale(deviceNumber, now - pendingTtlMillis, now - deliveredTtlMillis, now);
     }
 
+    /**
+     * End the device's delivered commands of {@code type} handed out before {@code deliveredBefore} as 'expired' with
+     * {@code detail}. Returns how many were ended.
+     */
+    public int abandonDelivered(String deviceNumber, String type, long deliveredBefore, long now, String detail) {
+        return mapper.abandonDelivered(deviceNumber, type, deliveredBefore, now, detail);
+    }
+
     /** Command lifecycle history for a device, newest first, created at/after {@code since}. */
     public List<AgentCommand> listHistory(String deviceNumber, long since, int limit) {
         return mapper.listHistory(deviceNumber, since, limit);
@@ -100,6 +114,16 @@ public class AgentCommandDAO {
     /** Current device-state snapshot, or null if none reported yet. */
     public DeviceState getState(String deviceNumber) {
         return stateMapper.findByDeviceNumber(deviceNumber);
+    }
+
+    /** Baseline the agent version for config resync (see ConfigReconciler). */
+    public void updateConfigAgentVersion(String deviceNumber, String version) {
+        stateMapper.updateConfigAgentVersion(deviceNumber, version);
+    }
+
+    /** A command was acked done: if it was a config.apply, the reporting agent version completed it. */
+    public void recordConfigApplyDone(String deviceNumber, Integer commandId) {
+        stateMapper.recordConfigApplyDone(deviceNumber, commandId);
     }
 
     /** Insert one agent lifecycle event. */
@@ -165,5 +189,30 @@ public class AgentCommandDAO {
     public java.util.List<com.hmdm.persistence.domain.DeviceLocation> listLocations(
             String deviceNumber, long since, int limit) {
         return deviceMapper.listLocations(deviceNumber, since, limit);
+    }
+
+    /** True if a pending or delivered command of {@code type} is already queued for the device. */
+    public boolean hasOpenOfType(String deviceNumber, String type) {
+        return mapper.countOpenOfType(deviceNumber, type) > 0;
+    }
+
+    /** The most recently created command of {@code type} for the device, or null if none exists. */
+    public AgentCommand findLatestOfType(String deviceNumber, String type) {
+        return mapper.findLatestOfType(deviceNumber, type);
+    }
+
+    /** The device's {@code limit} most recently created commands of {@code type}, newest first. */
+    public List<AgentCommand> listLatestOfType(String deviceNumber, String type, int limit) {
+        return mapper.listLatestOfType(deviceNumber, type, limit);
+    }
+
+    /** Device numbers currently assigned to a configuration. */
+    public List<String> listDeviceNumbersByConfigurationId(int configurationId) {
+        return deviceMapper.listDeviceNumbersByConfigurationId(configurationId);
+    }
+
+    /** One row per device of the customer with its configuration + last applied revision. */
+    public List<DeviceSyncRow> listDevicesForSync(int customerId) {
+        return deviceMapper.listDevicesForSync(customerId);
     }
 }

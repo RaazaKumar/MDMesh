@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate, useParams } from 'react-router';
 import { AppShell } from '../ui/AppShell';
 import { DeviceGlyph } from '../ui/DeviceGlyph';
 import {
@@ -9,7 +9,10 @@ import { ActionConsole } from '../components/ActionConsole';
 import { TelemetryCard } from '../components/TelemetryCard';
 import { EventTimeline } from '../components/EventTimeline';
 import { LocationPanel } from '../components/LocationPanel';
+import { listLocations, type LocationFix } from '../api/deviceLocations';
+import { ConfigStatusCard } from '../components/ConfigStatusCard';
 import { getTelemetry, type TelemetrySnapshot } from '../api/telemetry';
+import { getConfigStatus, type ConfigStatus } from '../api/configSync';
 import {
   getDeviceState, forceSync, queueCommand, syncConfigApps, type DeviceState,
 } from '../api/commands';
@@ -112,6 +115,46 @@ function NameField({
   );
 }
 
+const NUMBER_PAGE = 500;
+const NUMBER_PAGES_MAX = 20;
+const ID_PAGE = 1000;
+const ID_PAGES_MAX = 10;
+/** Database ids are small integers; a longer all-digit value (an IMEI, a serial) is only ever a number. */
+const ID_LIKE = /^\d{1,9}$/;
+
+/**
+ * The device a /devices/:id link names. Every link carries the device number, so an exact number match
+ * wins. The database id is only a fallback for old id-style links, used when no device has that number:
+ * /devices/12 must never open the device whose id is 12 while a device numbered "12" exists.
+ */
+async function resolveDevice(param: string): Promise<{
+  device: DeviceView | null;
+  configurations: Record<string, ConfigurationLookup>;
+  /** Found by database id, not by number. */
+  byId?: boolean;
+}> {
+  // A blank value would drop the server's filter and page through the whole fleet.
+  if (!param.trim()) return { device: null, configurations: {} };
+  // fastSearch makes the server match the number exactly (or its fast-search suffix), not as a substring.
+  for (let pageNum = 1; pageNum <= NUMBER_PAGES_MAX; pageNum++) {
+    const res = await searchDevices({ value: param, fastSearch: true, pageSize: NUMBER_PAGE, pageNum });
+    const items = res.devices?.items ?? [];
+    const hit = items.find((d) => d.number === param);
+    if (hit) return { device: hit, configurations: res.configurations ?? {} };
+    if (items.length < NUMBER_PAGE) break;
+  }
+  if (ID_LIKE.test(param)) {
+    for (let pageNum = 1; pageNum <= ID_PAGES_MAX; pageNum++) {
+      const res = await searchDevices({ pageSize: ID_PAGE, pageNum });
+      const items = res.devices?.items ?? [];
+      const hit = items.find((d) => String(d.id) === param);
+      if (hit) return { device: hit, configurations: res.configurations ?? {}, byId: true };
+      if (items.length < ID_PAGE) break;
+    }
+  }
+  return { device: null, configurations: {} };
+}
+
 export function DeviceDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -122,34 +165,41 @@ export function DeviceDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [tele, setTele] = useState<TelemetrySnapshot | null>(null);
   const [ds, setDs] = useState<DeviceState | null>(null);
+  const [cfgStatus, setCfgStatus] = useState<ConfigStatus | null>(null);
+  const [latestLocation, setLatestLocation] = useState<LocationFix | null>(null);
   const [tab, setTab] = useState<Tab>('control');
   const [busy, setBusy] = useState(false);
+  const loadSeq = useRef(0);
 
   const load = useCallback(async () => {
+    // A slower answer for the previous route must not replace this one's device.
+    const seq = ++loadSeq.current;
+    let redirected = false;
     setLoading(true);
     setError(null);
     try {
-      // The route param is the device number (see DevicesPage/DashboardPage links), so a narrow
-      // server-side search finds it without downloading the fleet. Old id-style links (and rare
-      // substring collisions on the number) miss it and fall back to the broad fetch.
-      const matches = (d: DeviceView) => d.number === id || String(d.id) === id;
-      let res = await searchDevices({ value: id, pageSize: 1 });
-      let found = (res.devices?.items ?? []).find(matches) ?? null;
-      if (!found) {
-        res = await searchDevices({ pageSize: 1000 });
-        found = (res.devices?.items ?? []).find(matches) ?? null;
+      // The route param is the device number (see DevicesPage/DashboardPage links).
+      const { device: found, configurations, byId } = await resolveDevice(id ?? '');
+      if (seq !== loadSeq.current) return;
+      if (found && byId) {
+        // An old id-style link: show the device under its number, so the URL names what is open.
+        redirected = true; // stay on the spinner until the number route loads
+        navigate(`/devices/${encodeURIComponent(found.number)}`, { replace: true });
+        return;
       }
-      setConfigs(res.configurations ?? {});
+      setConfigs(configurations);
       setDevice(found);
       if (!found) setError('Device not found.');
     } catch (err) {
+      if (seq !== loadSeq.current) return;
+      setDevice(null);
       if (err instanceof ApiError && err.httpStatus === 0)
         setError('Cannot reach the server.');
       else setError('Failed to load device.');
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current && !redirected) setLoading(false);
     }
-  }, [id]);
+  }, [id, navigate]);
 
   useEffect(() => {
     void load();
@@ -165,6 +215,7 @@ export function DeviceDetailPage() {
       await Promise.all([
         getTelemetry(device.number).then((v) => { if (on) setTele(v); }).catch(() => undefined),
         getDeviceState(device.number).then((v) => { if (on) setDs(v); }).catch(() => undefined),
+        getConfigStatus(device.number).then((v) => { if (on) setCfgStatus(v); }).catch(() => undefined),
       ]);
       if (!on) return;
       t = setTimeout(() => void poll(), 5000);
@@ -172,6 +223,19 @@ export function DeviceDetailPage() {
     void poll();
     return () => { on = false; clearTimeout(t); };
   }, [device]);
+
+  // Location is persisted independently from the compact telemetry snapshot. Refresh it when a
+  // real device-state update arrives, so the summary does not claim “no fix” merely because a
+  // later check-in omitted its optional dynamic.location object.
+  useEffect(() => setLatestLocation(null), [device?.number]);
+  useEffect(() => {
+    if (!device) return;
+    let active = true;
+    listLocations(device.number)
+      .then((fixes) => { if (active) setLatestLocation(fixes[0] ?? null); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [device?.number, ds?.updatedAt]);
 
   const configName =
     device?.configurationId != null
@@ -193,6 +257,7 @@ export function DeviceDetailPage() {
     try {
       await forceSync(device.number);
       void getDeviceState(device.number).then(setDs).catch(() => undefined);
+      void getConfigStatus(device.number).then(setCfgStatus).catch(() => undefined);
       toast.push('ok', 'Sync requested', '');
     } catch (e) {
       toast.push('err', 'Sync failed', e instanceof Error ? e.message : '');
@@ -282,14 +347,26 @@ export function DeviceDetailPage() {
   ];
   const managementRows: Row[] = [
     { k: 'Config', v: configName },
-    { k: 'Agent', v: orDash(ds?.agentVersion ?? device.launcherVersion) },
+    // Only the agent's own report: device.launcherVersion is the configuration's main-app version
+    // (Headwind assumed the main app was its launcher), so a kiosk app's version would show here.
+    { k: 'Agent', v: orDash(ds?.agentVersion) },
     { k: 'MDM mode', v: onOff(sec.isDeviceOwner, device.mdmMode) },
     { k: 'Enrolled', v: fmtDateTime(device.enrollTime) },
   ];
 
-  const loc = dyn.location as
+  const telemetryLocation = dyn.location as
     | { lat?: number; lon?: number; accuracyM?: number; provider?: string; capturedAt?: number }
     | undefined;
+  const storedLocation = latestLocation
+    ? {
+        lat: latestLocation.lat,
+        lon: latestLocation.lon,
+        accuracyM: latestLocation.accuracy,
+        provider: latestLocation.provider,
+        capturedAt: latestLocation.capturedAt,
+      }
+    : undefined;
+  const loc = storedLocation ?? telemetryLocation;
   const hasFix = !!loc && typeof loc.lat === 'number' && typeof loc.lon === 'number';
   const locationRows: Row[] = hasFix
     ? [
@@ -363,6 +440,8 @@ export function DeviceDetailPage() {
               ))}
             </div>
           ))}
+
+          <ConfigStatusCard status={cfgStatus} />
         </aside>
 
         {/* RIGHT: work */}

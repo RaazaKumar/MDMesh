@@ -9,9 +9,8 @@ kotlinx.serialization + Retrofit.
 - Identity is a **server-issued device id** (DataStore). The agent never uses
   IMEI/IMSI/serial as identity (restricted post-Android 10).
 
-> This scaffold will not build on a box without the Android SDK/Gradle. It is
-> structured to compile cleanly in CI or a provisioned dev box once an SDK is
-> present.
+> Building needs JDK 17 and the Android SDK: set `ANDROID_HOME`, or `sdk.dir` in
+> `local.properties` (gitignored). Gradle itself comes from the committed wrapper.
 
 ## Module map
 
@@ -19,11 +18,11 @@ kotlinx.serialization + Retrofit.
 |--------|------|----------------|
 | `:proto` | Kotlin/JVM lib | `@Serializable` wire contract mirroring `../proto/` (`CapabilityMatrix`, `CommandEnvelope`, `CommandResult`, `ProtocolJson`). No Android deps. |
 | `:policy` | android-lib | **Capability-abstraction layer.** `DeviceControl`, `PolicyStrategy`, SDK-gated `WifiPolicy` (modern/legacy strategies + factory), `CapabilityRegistry`. All `DevicePolicyManager` calls stay behind interfaces. |
-| `:core` | android-lib | Sync/check-in: Retrofit `MdmApi`, `CapabilityCollector`, `CommandDispatcher` (+ handlers), `DeviceIdStore` (DataStore), `CheckInCoordinator`/`CheckInWorker`. Base URL via `BuildConfig`. |
-| `:kiosk` | android-lib | COSU skeleton: `KioskController` (+ stub), `CrashLoopGuard`. |
+| `:core` | android-lib | Sync/check-in: Retrofit `MdmApi`, `CapabilityCollector`, `CommandDispatcher` (+ handlers), `DeviceIdStore` (DataStore), `CheckInCoordinator`/`CheckInWorker`. Base URL from the enrollment QR (`com.mdmesh.SERVER_URL`, kept in `ServerConfigStore`); `BuildConfig.MDM_BASE_URL` is the fallback for ADB enrollment. |
+| `:kiosk` | android-lib | COSU lock-task: `KioskController`, its real impl `LockTaskKioskController` (+ `StubKioskController`), `CrashLoopGuard`, `ExitPinGate`. |
 | `:remote` | android-lib | Remote view/control skeleton: `RemoteControlSession`, `RemoteControlTierDetector`, and the **only** Accessibility surface (`InputInjectionService`). |
 | `:oem` | android-lib | `OemAdapter` + `GenericOemAdapter` (no-op) + `KnoxAdapter` (PARKED, no Knox dep). |
-| `:app` | android-app | Hilt `Application`, `AdminReceiver`, provisioning activities, `MainActivity` launcher/home stub, `CheckInService`, manifest with the minimal permission set. |
+| `:app` | android-app | Hilt `Application`, `AdminReceiver`, provisioning activities, `MainActivity`, `KioskLauncherActivity` (the kiosk HOME), `CheckInService`, manifest with the minimal permission set. |
 
 ### The capability-abstraction intent
 
@@ -50,17 +49,14 @@ to the same server without special-casing. Unknown command types degrade to
 ## Build
 
 ```bash
-# One-time: generate the binary wrapper jar (cannot be committed from this box).
-gradle wrapper --gradle-version 8.10.2
-
-# Then the usual:
-./gradlew assembleDebug
-./gradlew test          # :proto + :core JVM unit tests
+./gradlew assembleDebug                                      # app/build/outputs/apk/debug/app-debug.apk
+./gradlew detekt assembleDebug lintDebug testDebugUnitTest   # what CI runs (T0)
 ```
 
-> The repo ships `gradlew`, `gradlew.bat`, and `gradle/wrapper/gradle-wrapper.properties`,
-> but **not** `gradle/wrapper/gradle-wrapper.jar` (a binary). Run `gradle wrapper`
-> once on a machine that has a system Gradle to materialise it.
+> The Gradle wrapper is committed (`gradlew`, `gradlew.bat`, `gradle/wrapper/gradle-wrapper.jar`
+> and `.properties`, pinned to Gradle 8.10.2), so no system Gradle is needed: the first `./gradlew`
+> run downloads that version. Upgrade it with `./gradlew wrapper --gradle-version <version>` and
+> commit all four files.
 
 Release signing reads from env vars (`MDM_RELEASE_STORE_FILE`,
 `MDM_RELEASE_STORE_PASSWORD`, `MDM_RELEASE_KEY_ALIAS`, `MDM_RELEASE_KEY_PASSWORD`);

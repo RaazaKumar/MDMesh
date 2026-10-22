@@ -3,7 +3,34 @@
 #   own-domain  → "mdm.example.com" (Caddy auto-provisions + renews a Let's Encrypt cert)
 #   cloudflare  → ":80" (Cloudflare terminates TLS; cloudflared connects to this internally)
 {
-	email {$ACME_EMAIL}
+	email "{$ACME_EMAIL}"
+	# Who Caddy believes about a client's address ({client_ip}, which the server records as a device's public IP).
+	# Set per listener, so each hosting mode gets its own rule. Strict mode reads a header list from the right, so an
+	# address a client prepends never counts.
+	#   :443  own domain. Devices connect to Caddy directly, so nothing they send is believed: only a peer in
+	#         TRUSTED_PROXIES (default loopback, which no Docker peer is) may set X-Forwarded-For.
+	#   :80   set by docker/edge-peers.sh (the image's entrypoint), by hosting mode. Cloudflare tunnel: cloudflared's
+	#         CF-Connecting-IP, from a private peer. Anything else (the dev stack, a proxy of your own in front):
+	#         TRUSTED_PROXIES and X-Forwarded-For, as on :443. The defaults here are that second rule.
+	# Own-domain's :80 only redirects to HTTPS, so the :80 rule never applies to its traffic.
+	servers :443 {
+		trusted_proxies static {$TRUSTED_PROXIES:127.0.0.1/32 ::1/128}
+		trusted_proxies_strict
+	}
+	servers :80 {
+		trusted_proxies static {$HTTP_TRUSTED_PEERS:127.0.0.1/32 ::1/128}
+		client_ip_headers {$HTTP_CLIENT_IP_HEADER:X-Forwarded-For}
+		trusted_proxies_strict
+	}
+}
+
+# Every reverse_proxy to the server imports this. The server reads the client's address from X-Forwarded-For (and
+# X-Real-IP, in code inherited from Headwind), so send exactly one value, Caddy's {client_ip}, and drop a client-sent
+# CF-Connecting-IP. header_up runs after reverse_proxy's own X-Forwarded-For handling, so it wins.
+(client_address) {
+	header_up X-Forwarded-For {client_ip}
+	header_up X-Real-IP {client_ip}
+	header_up -CF-Connecting-IP
 }
 
 {$SITE_ADDRESS} {
@@ -23,7 +50,9 @@
 	# upgrades WebSockets automatically, so /agent/ws works without extra config.
 	@backend path /rest/* /files/* /agent/ws/*
 	handle @backend {
-		reverse_proxy server:8080
+		reverse_proxy server:8080 {
+			import client_address
+		}
 	}
 
 	# Updater status + recovery page → the decoupled supervisor (always up, independent of the
@@ -35,6 +64,42 @@
 		reverse_proxy supervisor:9000
 	}
 
+	# Health probes for uptime monitors. Both answer 200 "ok" or 503, never the SPA's catch-all 200:
+	#   /healthz            the edge AND the API server answer (the probe apply.sh/rollback.sh use to call
+	#                       an update healthy: GET /rest/public/name, no DB round-trip, no auth)
+	#   /healthz/supervisor the updater/recovery supervisor answers (update checks, recovery page, and the
+	#                       /files/agent.apk mirror that new enrollments download)
+	# Each also answers with a trailing slash (exact paths only, nothing below them), so /healthz/ cannot fall through
+	# to the SPA's 200. `rewrite` inside reverse_proxy changes only the upstream request, so handle_errors below still
+	# sees the probe path.
+	@healthz path /healthz /healthz/
+	@healthzSupervisor path /healthz/supervisor /healthz/supervisor/
+	handle @healthz {
+		reverse_proxy server:8080 {
+			import client_address
+			rewrite /rest/public/name
+			@up status 2xx
+			handle_response @up {
+				respond "ok" 200
+			}
+			handle_response {
+				respond "server unavailable" 503
+			}
+		}
+	}
+	handle @healthzSupervisor {
+		reverse_proxy supervisor:9000 {
+			rewrite /healthz
+			@up status 2xx
+			handle_response @up {
+				respond "ok" 200
+			}
+			handle_response {
+				respond "supervisor unavailable" 503
+			}
+		}
+	}
+
 	# Everything else is the single-page app.
 	handle {
 		root * /srv
@@ -42,8 +107,17 @@
 		file_server
 	}
 
-	# If the server (API) is down/erroring, fall back to the supervisor's recovery page.
+	# If the server (API) is down/erroring, fall back to the supervisor's recovery page. Not for the health
+	# probes: proxied as-is, /healthz would reach the supervisor's own /healthz and call a dead server "ok".
 	handle_errors {
-		reverse_proxy supervisor:9000
+		handle @healthz {
+			respond "server unavailable" 503
+		}
+		handle @healthzSupervisor {
+			respond "supervisor unavailable" 503
+		}
+		handle {
+			reverse_proxy supervisor:9000
+		}
 	}
 }

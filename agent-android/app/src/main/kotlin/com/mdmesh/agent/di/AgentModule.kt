@@ -3,6 +3,7 @@ package com.mdmesh.agent.di
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
+import android.os.SystemClock
 import com.mdmesh.agent.BuildConfig
 import com.mdmesh.agent.admin.AdminReceiver
 import com.mdmesh.core.capability.CapabilityCollector
@@ -16,6 +17,7 @@ import com.mdmesh.core.command.handlers.AppIconsHandler
 import com.mdmesh.core.command.handlers.AppInstallHandler
 import com.mdmesh.core.command.handlers.AppScanHandler
 import com.mdmesh.core.command.handlers.AppUninstallHandler
+import com.mdmesh.core.command.handlers.ConfigApplyHandler
 import com.mdmesh.core.command.handlers.ConfigSyncHandler
 import com.mdmesh.core.command.handlers.DeviceAlertHandler
 import com.mdmesh.core.command.handlers.DeviceLockHandler
@@ -27,19 +29,26 @@ import com.mdmesh.core.command.handlers.DeviceLocationModeHandler
 import com.mdmesh.core.command.handlers.DevicePowerModeHandler
 import com.mdmesh.core.command.handlers.DeviceRingStopHandler
 import com.mdmesh.core.command.handlers.DeviceWipeHandler
+import com.mdmesh.core.config.ConfigApplier
 import com.mdmesh.core.location.LocationModeStore
 import com.mdmesh.core.power.PowerModeStore
 import com.mdmesh.core.command.handlers.KioskEnterHandler
 import com.mdmesh.core.command.handlers.KioskExitHandler
+import com.mdmesh.core.kiosk.AndroidKioskHomeSwitch
+import com.mdmesh.core.kiosk.KioskApplier
 import com.mdmesh.core.command.handlers.PolicyApplyHandler
 import com.mdmesh.core.device.AppInventoryCollector
 import com.mdmesh.core.device.HardwareIdCollector
 import com.mdmesh.core.sync.HardwareIdSource
+import com.mdmesh.core.sync.LastCheckIn
+import com.mdmesh.core.sync.SharedPrefsLastCheckIn
 import com.mdmesh.core.install.InstallManager
 import com.mdmesh.core.state.DeviceStateCollector
 import com.mdmesh.core.state.DeviceStateSource
+import com.mdmesh.core.store.ConfigStateStore
 import com.mdmesh.core.store.DataStoreKioskStateStore
 import com.mdmesh.core.store.KioskStateStore
+import com.mdmesh.core.store.SharedPrefsConfigStateStore
 import com.mdmesh.core.telemetry.EventLog
 import com.mdmesh.core.telemetry.EventSink
 import com.mdmesh.core.telemetry.DeviceInfoCollector
@@ -51,16 +60,20 @@ import com.mdmesh.core.telemetry.TelemetrySource
 import com.mdmesh.proto.AppManagement
 import com.mdmesh.proto.DeviceAction
 import com.mdmesh.kiosk.CrashLoopGuard
+import com.mdmesh.kiosk.ExitPinGate
 import com.mdmesh.kiosk.FaultStore
 import com.mdmesh.kiosk.KioskController
 import com.mdmesh.kiosk.LockTaskKioskController
+import com.mdmesh.kiosk.PinAttemptStore
 import com.mdmesh.kiosk.SharedPrefsFaultStore
+import com.mdmesh.kiosk.SharedPrefsPinAttemptStore
 import com.mdmesh.oem.GenericOemAdapter
 import com.mdmesh.oem.KnoxAdapter
 import com.mdmesh.oem.OemAdapter
 import com.mdmesh.policy.CapabilityRegistry
-import com.mdmesh.policy.TogglePolicy
+import com.mdmesh.policy.wifi.AndroidWifiRadio
 import com.mdmesh.policy.wifi.DpmHandle
+import com.mdmesh.policy.wifi.SharedPrefsWifiRadioOffState
 import com.mdmesh.remote.RemoteControlTierDetector
 import dagger.Module
 import dagger.Provides
@@ -91,8 +104,8 @@ object AgentModule {
 
     @Provides
     @Singleton
-    fun provideCapabilityRegistry(handle: DpmHandle): CapabilityRegistry =
-        CapabilityRegistry(handle)
+    fun provideCapabilityRegistry(@ApplicationContext context: Context, handle: DpmHandle): CapabilityRegistry =
+        CapabilityRegistry(handle, AndroidWifiRadio.from(context), SharedPrefsWifiRadioOffState(context))
 
     @Provides
     @Singleton
@@ -121,17 +134,18 @@ object AgentModule {
         oemAdapter: OemAdapter,
         handle: DpmHandle,
     ): CapabilityCollector {
-        val deviceOwner = handle.dpm.isDeviceOwnerApp(context.packageName)
         return CapabilityCollector(
             agentVersion = BuildConfig.VERSION_NAME,
             agentPackage = context.packageName,
-            isDeviceOwner = deviceOwner,
-            capabilityRegistry = registry,
-            remoteTierDetector = remoteTierDetector,
-            oemAdapter = oemAdapter,
+            // A lambda, not a value: this collector is a @Singleton and Device-Owner status only
+            // flips to true partway through provisioning — see CapabilityCollector.collect().
+            isDeviceOwner = { handle.dpm.isDeviceOwnerApp(context.packageName) },
+            policyKeys = registry::supportedPolicyKeys,
+            remoteControl = remoteTierDetector::capability,
+            oem = oemAdapter::capability,
             // Silent install needs Device Owner — advertise app.silentInstall only when we have it, so
             // the server's capability gate won't queue an app.install we can't perform.
-            appManagementKeys = if (deviceOwner) AppManagement.DEVICE_OWNER_KEYS else emptyList(),
+            deviceOwnerAppManagementKeys = AppManagement.DEVICE_OWNER_KEYS,
             deviceActionKeys = DeviceAction.ADVERTISED_KEYS,
         )
     }
@@ -167,11 +181,6 @@ object AgentModule {
         security = { security.collect() },
     )
 
-    /** The supported toggle policies, keyed by capability key (data-driven routing). */
-    @Provides
-    fun providePolicyToggles(registry: CapabilityRegistry): Map<String, TogglePolicy> =
-        registry.togglePolicies()
-
     // --- Command handlers (multibound). Add a command == add one @IntoSet provider. ---
 
     @Provides
@@ -180,9 +189,9 @@ object AgentModule {
 
     @Provides
     @IntoSet
-    fun providePolicyApplyHandler(
-        toggles: Map<String, @JvmSuppressWildcards TogglePolicy>,
-    ): CommandHandler = PolicyApplyHandler(toggles)
+    fun providePolicyApplyHandler(registry: CapabilityRegistry): CommandHandler =
+        // A function, not a map: the toggles are resolved per command (Device Owner arrives after process start, #76).
+        PolicyApplyHandler(registry::togglePolicies)
 
     @Provides
     @Singleton
@@ -210,6 +219,17 @@ object AgentModule {
     @Provides
     @Singleton
     fun provideCrashLoopGuard(store: FaultStore): CrashLoopGuard = CrashLoopGuard(store)
+
+    @Provides
+    @Singleton
+    fun providePinAttemptStore(@ApplicationContext context: Context): PinAttemptStore =
+        SharedPrefsPinAttemptStore(context)
+
+    @Provides
+    @Singleton
+    fun provideExitPinGate(store: PinAttemptStore): ExitPinGate =
+        // Uptime, not wall time: it can't be set, so changing the clock can't shorten a lockout.
+        ExitPinGate(store) { SystemClock.elapsedRealtime() }
 
     // --- App-management + kiosk + device command handlers (multibound) ---
 
@@ -244,20 +264,21 @@ object AgentModule {
         ComponentName(context.packageName, "com.mdmesh.agent.KioskHomeAlias")
 
     @Provides
-    @IntoSet
-    fun provideKioskEnterHandler(
+    @Singleton
+    fun provideKioskApplier(
         kiosk: KioskController,
         store: KioskStateStore,
         @ApplicationContext context: Context,
-    ): CommandHandler = KioskEnterHandler(kiosk, store, kioskHomeAlias(context), context)
+    ): KioskApplier {
+        val home = kioskHomeAlias(context)
+        return KioskApplier(kiosk, store, AndroidKioskHomeSwitch(context, home), home) { kiosk.isLocked(context) }
+    }
 
-    @Provides
-    @IntoSet
-    fun provideKioskExitHandler(
-        kiosk: KioskController,
-        store: KioskStateStore,
-        @ApplicationContext context: Context,
-    ): CommandHandler = KioskExitHandler(kiosk, store, kioskHomeAlias(context), context)
+    @Provides @IntoSet
+    fun provideKioskEnterHandler(applier: KioskApplier): CommandHandler = KioskEnterHandler(applier)
+
+    @Provides @IntoSet
+    fun provideKioskExitHandler(applier: KioskApplier): CommandHandler = KioskExitHandler(applier)
 
     @Provides
     @IntoSet
@@ -310,4 +331,28 @@ object AgentModule {
     @IntoSet
     fun provideLocationModeHandler(store: LocationModeStore): CommandHandler =
         DeviceLocationModeHandler(store)
+
+    // --- Desired-state configuration (config.apply) ---
+
+    @Provides
+    @Singleton
+    fun provideConfigStateStore(@ApplicationContext context: Context): ConfigStateStore =
+        SharedPrefsConfigStateStore(context)
+
+    @Provides
+    @Singleton
+    fun provideLastCheckIn(@ApplicationContext context: Context): LastCheckIn = SharedPrefsLastCheckIn(context)
+
+    @Provides
+    @Singleton
+    fun provideConfigApplier(
+        registry: CapabilityRegistry,
+        kiosk: KioskApplier,
+        location: LocationModeStore,
+        store: ConfigStateStore,
+    ): ConfigApplier = ConfigApplier(registry::togglePolicies, kiosk, location::set, store)
+
+    @Provides
+    @IntoSet
+    fun provideConfigApplyHandler(applier: ConfigApplier): CommandHandler = ConfigApplyHandler(applier)
 }

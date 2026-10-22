@@ -113,16 +113,9 @@ public final class Initializer extends GuiceServletContextListener {
 
     public void contextInitialized(ServletContextEvent servletContextEvent) {
         this.context = servletContextEvent.getServletContext();
-
-        String log4jConfig = context.getInitParameter("log4j.config");
-        if (log4jConfig != null && !log4jConfig.isEmpty()) {
-            System.out.println("[HMDM-LOGGING] : Using log4j configuration from: " + log4jConfig);
-            System.setProperty("log4j.configuration", log4jConfig);
-            System.setProperty("log4j.ignoreTCL", "true");
-        } else {
-            System.out.println("[HMDM-LOGGING] Using log4j configuration from build");
-        }
-
+        // Logging is the WAR's log4j.xml only. log4j reads it when the first logger is created, which is before this
+        // listener runs, so a context parameter can never pick another config at start (the old log4j.config
+        // parameter only took effect after a context reload).
         super.contextInitialized(servletContextEvent);
 
         initTasks();
@@ -180,5 +173,19 @@ public final class Initializer extends GuiceServletContextListener {
 
         final StartupTaskModule startupTaskModule = this.injector.getInstance(StartupTaskModule.class);
         startupTaskModule.init();
+    }
+
+    /**
+     * <p>Tomcat is stopping or undeploying us. Let Guice tear down, then end every thread pool the
+     * server created — otherwise their non-daemon threads keep the JVM alive after the container has
+     * shut down and {@code catalina.sh stop} never completes.</p>
+     */
+    @Override
+    public void contextDestroyed(ServletContextEvent servletContextEvent) {
+        try {
+            super.contextDestroyed(servletContextEvent);
+        } finally {
+            com.hmdm.util.ExecutorRegistry.shutdownAll(10);
+        }
     }
 }

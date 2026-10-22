@@ -46,6 +46,15 @@ class UserRestrictionsTest {
         assertEquals("no_usb_file_transfer", UserRestrictions.DISALLOW_USB_FILE_TRANSFER)
         assertEquals("no_physical_media", UserRestrictions.DISALLOW_MOUNT_PHYSICAL_MEDIA)
         assertEquals("no_factory_reset", UserRestrictions.DISALLOW_FACTORY_RESET)
+        assertEquals("no_safe_boot", UserRestrictions.DISALLOW_SAFE_BOOT)
+    }
+
+    @Test
+    fun `safeBoot maps to the single DISALLOW_SAFE_BOOT restriction`() {
+        assertEquals(
+            setOf(UserRestrictions.DISALLOW_SAFE_BOOT),
+            UserRestrictions.forKey("safeBoot"),
+        )
     }
 
     @Test
@@ -54,6 +63,9 @@ class UserRestrictionsTest {
         assertNull(UserRestrictions.forKey("screenshots"))
         assertNull(UserRestrictions.forKey("wifi"))
         assertNull(UserRestrictions.forKey("unknown"))
+        // The registry's unimplemented FRP row is a different capability: setFactoryResetProtectionPolicy
+        // (API 30) and not a user restriction, so it must not be served by this mapping.
+        assertNull(UserRestrictions.forKey("factoryResetProtection"))
     }
 
     @Test
@@ -70,17 +82,23 @@ class UserRestrictionsTest {
     }
 
     @Test
-    fun `factoryReset requires API 27 because DISALLOW_FACTORY_RESET is honoured from O_MR1`() {
+    fun `factoryReset requires only API 21 so the module floor is sufficient`() {
         val min = UserRestrictions.minSdkForKey("factoryReset")
-        assertEquals(27, min)
-        // Above the module floor (24), so this key must be gated at runtime rather
-        // than assumed available.
-        assertTrue("factoryReset min SDK must be above the module floor", min!! > 24)
+        assertEquals(21, min)
+        assertTrue("factoryReset min SDK must be <= module minSdk (24)", min!! <= 24)
+    }
+
+    @Test
+    fun `safeBoot requires API 23 so the module floor is sufficient`() {
+        val min = UserRestrictions.minSdkForKey("safeBoot")
+        assertEquals(23, min)
+        assertTrue("safeBoot min SDK must be <= module minSdk (24)", min!! <= 24)
     }
 
     @Test
     fun `min SDK is null for keys this helper does not own`() {
         assertNull(UserRestrictions.minSdkForKey("camera"))
+        assertNull(UserRestrictions.minSdkForKey("factoryResetProtection"))
         assertNull(UserRestrictions.minSdkForKey("unknown"))
     }
 }

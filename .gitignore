@@ -60,6 +60,9 @@ reference/hmdm-android/
 .env.*.local
 
 # OS / editor / build cruft
+# Python bytecode (e.g. from running the vendored ci-kit's changed-paths tests; scripts/vendor.sh copies it)
+__pycache__/
+*.py[cod]
 .DS_Store
 Thumbs.db
 *.log
@@ -67,3 +70,6 @@ Thumbs.db
 *.orig
 *~
 *.swp
+
+# Maintainer-local Claude Code notes
+/CLAUDE.md

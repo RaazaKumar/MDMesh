@@ -2,7 +2,9 @@
 # "no clone, no build" deploy. Easiest via quickstart.sh, or by hand:
 #
 #   curl -fsSLO https://raw.githubusercontent.com/MDMesh-app/MDMesh/main/docker-compose.release.yml
-#   # write a .env (DB_PASSWORD, HASH_SECRET, BASE_URL, IMAGE_OWNER, …) — see quickstart.sh
+#   # write a .env (DB_PASSWORD, HASH_SECRET, BASE_URL, IMAGE_OWNER, …) — see quickstart.sh. For the tunnel, include
+#   # COMPOSE_PROFILES=cloudflare: --profile alone doesn't reach caddy, which then won't believe cloudflared's
+#   # CF-Connecting-IP (docker/edge-peers.sh)
 #   docker compose -f docker-compose.release.yml --profile cloudflare up -d                 # tunnel
 #   docker compose -f docker-compose.release.yml -f docker-compose.domain.yml up -d         # own domain
 #
@@ -37,12 +39,21 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
       BASE_URL: ${BASE_URL:?set BASE_URL in .env}
       HASH_SECRET: ${HASH_SECRET:?set HASH_SECRET in .env}
+      # Optional; unset = the key the server keeps in its volume. Prefixed .env key for the reason given at JAVA_OPTS.
+      JWT_SECRET: ${SERVER_JWT_SECRET:-}
       SECURE_ENROLLMENT: ${SECURE_ENROLLMENT:-0}
+      LEGACY_DEVICE_API: ${LEGACY_DEVICE_API:-0}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-25}
       SMTP_FROM: ${SMTP_FROM:-mdm@localhost}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_SSL: ${SMTP_SSL:-false}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      # Optional JVM flags, e.g. a temporary DEBUG log config (docs/OPERATIONS.md "Server logs"). Read from the
+      # prefixed .env key: compose lets the shell override .env, and a generic JAVA_OPTS exported on a Java host must
+      # not reach the server.
+      JAVA_OPTS: ${SERVER_JAVA_OPTS:-}
     volumes:
       - mdmeshdata:/opt/mdmesh
 
@@ -55,6 +66,9 @@ services:
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
       ACME_EMAIL: ${ACME_EMAIL:-}
+      # The hosting mode: in tunnel mode (cloudflare) the edge believes cloudflared's CF-Connecting-IP
+      # (docker/edge-peers.sh).
+      COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}
     volumes:
       - caddy_data:/data
       - caddy_config:/config
@@ -62,7 +76,6 @@ services:
   supervisor:
     image: ghcr.io/${IMAGE_OWNER:-mdmesh-app}/mdmesh-supervisor:${SUPERVISOR_VERSION:-latest}
     restart: unless-stopped
-    working_dir: /project
     environment:
       GITHUB_REPO: ${GITHUB_REPO:-}
       UPDATE_CHANNEL: ${UPDATE_CHANNEL:-stable}
@@ -70,6 +83,8 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       CURRENT_VERSION: ${CURRENT_VERSION:-0.0.0}
       AUTO_UPDATE: ${AUTO_UPDATE:-0}
+      # Set 0 to hide one-click apply (the console then shows the manual upgrade steps).
+      APPLY_SUPPORTED: ${APPLY_SUPPORTED:-1}
       COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-mdmesh}
       COMPOSE_FILE: ${COMPOSE_FILE:-docker-compose.yml}
       COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}

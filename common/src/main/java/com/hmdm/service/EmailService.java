@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.inject.Named;
 import javax.mail.*;
+import javax.mail.internet.AddressException;
 import javax.mail.internet.InternetAddress;
 import javax.mail.internet.MimeBodyPart;
 import javax.mail.internet.MimeMessage;
@@ -50,6 +51,11 @@ import java.util.Properties;
 public class EmailService {
 
     private static final Logger logger = LoggerFactory.getLogger(EmailService.class);
+
+    /** How long to wait for the mail server to accept a connection, answer, or take data. */
+    static final int CONNECT_TIMEOUT_MS = 10_000;
+    static final int READ_TIMEOUT_MS = 20_000;
+    static final int WRITE_TIMEOUT_MS = 20_000;
 
     private final String smtpHost;
     private final int smtpPort;
@@ -125,18 +131,68 @@ public class EmailService {
             return false;
         }
         try {
-            Properties properties = new Properties();
-            properties.put("mail.smtp.host", smtpHost);
-            properties.put("mail.smtp.port", smtpPort);
-            properties.put("mail.smtp.auth", !smtpUsername.equals(""));
-            properties.put("mail.smtp.ssl.enable", sslEnabled);
-            properties.put("mail.smtp.starttls.enable", startTlsEnabled);
-            if (!StringUtil.isEmpty(sslProtocols)) {
-                properties.put("mail.smtp.ssl.protocols", sslProtocols);
-            }
-            if (!StringUtil.isEmpty(sslTrust)) {
-                properties.put("mail.smtp.ssl.trust", sslTrust);
-            }
+            return send(InternetAddress.parse(to), subj, body, replyTo, "text/html; charset=utf-8");
+        } catch (Exception e) {
+            logger.warn(e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Sends a plain-text mail (the body is shown as is, never rendered as HTML) to exactly one address. A list of
+     * addresses is refused, so one user's email field can't fan the mail out.
+     */
+    public boolean sendPlainTextEmail(String to, String subj, String body) {
+        InternetAddress address = singleAddress(to);
+        if (address == null) {
+            logger.warn("Mail not sent: the recipient is not a single email address");
+            return false;
+        }
+        if (smtpHost.equals("")) {
+            return false;
+        }
+        return send(new InternetAddress[]{address}, subj, body, null, "text/plain; charset=utf-8");
+    }
+
+    /** One strictly parsed address ("a@example.com" or "Ann <a@example.com>"), or null for anything else. */
+    public static InternetAddress singleAddress(String text) {
+        if (text == null || text.trim().isEmpty() || text.indexOf(',') >= 0) {
+            return null;
+        }
+        try {
+            return new InternetAddress(text.trim(), true);
+        } catch (AddressException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The JavaMail session settings. The timeouts matter: JavaMail waits forever by default, so a mail server that
+     * stops answering would hang the sending thread (a request thread, or the background alert thread) for good. The
+     * transport is always "smtp" (SSL is switched on with mail.smtp.ssl.enable), so no mail.smtps.* keys are needed.
+     */
+    Properties smtpProperties() {
+        Properties properties = new Properties();
+        properties.put("mail.smtp.host", smtpHost);
+        properties.put("mail.smtp.port", smtpPort);
+        properties.put("mail.smtp.auth", !smtpUsername.equals(""));
+        properties.put("mail.smtp.ssl.enable", sslEnabled);
+        properties.put("mail.smtp.starttls.enable", startTlsEnabled);
+        if (!StringUtil.isEmpty(sslProtocols)) {
+            properties.put("mail.smtp.ssl.protocols", sslProtocols);
+        }
+        if (!StringUtil.isEmpty(sslTrust)) {
+            properties.put("mail.smtp.ssl.trust", sslTrust);
+        }
+        properties.setProperty("mail.smtp.connectiontimeout", String.valueOf(CONNECT_TIMEOUT_MS));
+        properties.setProperty("mail.smtp.timeout", String.valueOf(READ_TIMEOUT_MS));
+        properties.setProperty("mail.smtp.writetimeout", String.valueOf(WRITE_TIMEOUT_MS));
+        return properties;
+    }
+
+    private boolean send(InternetAddress[] to, String subj, String body, String replyTo, String contentType) {
+        try {
+            Properties properties = smtpProperties();
 
             logger.info("SMTP connection: " + smtpHost + ":" + smtpPort + ", ssl:" + sslEnabled + ", startTls:" + startTlsEnabled);
 
@@ -149,14 +205,14 @@ public class EmailService {
 
             Message message = new MimeMessage(session);
             message.setFrom(new InternetAddress(smtpFrom));
-            message.setRecipients(Message.RecipientType.TO, InternetAddress.parse(to));
+            message.setRecipients(Message.RecipientType.TO, to);
             if (replyTo != null && !replyTo.equals("")) {
                 message.addHeader("Reply-To", replyTo);
             }
             message.setSubject(subj);
 
             MimeBodyPart mimeBodyPart = new MimeBodyPart();
-            mimeBodyPart.setContent(body, "text/html; charset=utf-8");
+            mimeBodyPart.setContent(body, contentType);
 
             Multipart multipart = new MimeMultipart();
             multipart.addBodyPart(mimeBodyPart);

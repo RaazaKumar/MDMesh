@@ -14,12 +14,16 @@ import com.mdmesh.policy.TogglePolicy
  *  - [com.mdmesh.policy.wifi.LegacyWifiPolicy] (API 24–29) falls back to the
  *    older user-restriction path.
  *
- * [WifiPolicyFactory] selects the right one once, at construction. Feature code
- * only ever sees this interface.
+ * [WifiPolicyFactory] selects the right one once, when Wi-Fi control is first
+ * supported (see [com.mdmesh.policy.TogglePolicyResolver]). Feature code only
+ * ever sees this interface.
  */
 interface WifiPolicy : TogglePolicy {
 
-    /** Enable or disable Wi-Fi as Device Owner. (from [TogglePolicy]) */
+    /**
+     * Allow (`true`) or lock (`false`) the Wi-Fi settings. Does not switch the radio: that is the separate
+     * `wifiRadio` policy ([WifiRadioPolicy]). (from [TogglePolicy])
+     */
     override fun setEnabled(enabled: Boolean): PolicyOutcome
 
     /** Lock the user out of changing Wi-Fi configuration. */

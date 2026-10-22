@@ -1,0 +1,195 @@
+package com.hmdm.util;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hmdm.persistence.domain.Application;
+import com.hmdm.persistence.domain.Configuration;
+import com.hmdm.persistence.domain.RequestUpdatesType;
+import com.hmdm.rest.json.agent.DesiredConfig;
+import com.hmdm.rest.json.agent.DesiredKiosk;
+import com.hmdm.rest.json.agent.DesiredKioskFeatures;
+import com.hmdm.rest.json.agent.DesiredKioskTheme;
+import com.hmdm.rest.json.agent.DesiredLocation;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+
+/**
+ * The ONLY place a {@link Configuration} row becomes a {@code config.apply} desired-state document.
+ * Pure and deterministic: same inputs -&gt; same canonical JSON -&gt; same revision, on every server node,
+ * so a device's reported {@code appliedConfigRevision} can be compared without storing anything.
+ *
+ * <p>Note: {@link Configuration#getMainAppId()} is an {@code applicationVersions.id}, NOT an
+ * {@code applications.id} (Liquibase remapped the column; {@code recheckConfigurationMainApplication}
+ * sets it from {@code configurationApplications.applicationVersionId}). The main app is therefore the
+ * configuration app whose {@link Application#getUsedVersionId()} equals it.</p>
+ */
+public final class DesiredConfigBuilder {
+    public static final String COMMAND_TYPE = "config.apply";
+    public static final String CAPABILITY = "device.configApply";
+    public static final String POLICY_PREFIX = "policies.";
+    public static final String KEY_KIOSK = "kiosk";
+    public static final String KEY_LOCATION = "location";
+    private static final int ACTION_INSTALL = 1;
+
+    private static final ObjectMapper PLAIN = new ObjectMapper();
+
+    private DesiredConfigBuilder() {}
+
+    public static DesiredConfig build(Configuration cfg, List<Application> apps) {
+        DesiredConfig d = new DesiredConfig();
+        d.setConfigurationId(cfg.getId());
+        d.setPolicies(policies(cfg));
+        d.setKiosk(cfg.isKioskMode() ? kiosk(cfg, apps == null ? Collections.<Application>emptyList() : apps) : null);
+        DesiredLocation loc = new DesiredLocation();
+        loc.setMode(locationMode(cfg.getRequestUpdates()));
+        d.setLocation(loc);
+        d.setRevision(revision(d));
+        return d;
+    }
+
+    /**
+     * GPS = a fresh fix each check-in; WIFI (console "Last known (passive)", formerly "Network") = the OS's last-known fix; DONOTTRACK (the column default,
+     * also used for null) = read nothing. {@code off} is protocol 1.4: an older agent treats it as passive, which is
+     * why {@link #isDoNotTrack} also makes the server drop any location such a device still reports.
+     */
+    static String locationMode(RequestUpdatesType t) {
+        if (t == RequestUpdatesType.GPS) return "active";
+        if (t == RequestUpdatesType.WIFI) return "passive";
+        return "off";
+    }
+
+    /** True when the configuration says "Do not track": the server then stores no location for its devices. */
+    public static boolean isDoNotTrack(Configuration cfg) {
+        return cfg != null && "off".equals(locationMode(cfg.getRequestUpdates()));
+    }
+
+    private static Map<String, Boolean> policies(Configuration cfg) {
+        Map<String, Boolean> p = new TreeMap<String, Boolean>();
+        // wifi = lock/allow the Wi-Fi settings only; wifiRadio (1.4) switches the radio itself.
+        putIfManaged(p, "wifi", cfg.getWifi());
+        putIfManaged(p, "wifiRadio", cfg.getWifiRadio());
+        putIfManaged(p, "bluetooth", cfg.getBluetooth());
+        putIfManaged(p, "usbStorage", cfg.getUsbStorage());
+        putIfManaged(p, "screenshots", cfg.getDisableScreenshots() == null ? null : !cfg.getDisableScreenshots());
+        putIfManaged(p, "factoryReset", cfg.getDisableFactoryReset() == null ? null : !cfg.getDisableFactoryReset());
+        putIfManaged(p, "safeBoot", safeBootAllowed(cfg));
+        return p;
+    }
+
+    /**
+     * Safe Mode starts the phone's own launcher and gets around kiosk, so a kiosk configuration that leaves it
+     * unmanaged blocks it. An explicit setting wins either way; when kiosk ends the key is unmanaged again and the agent
+     * lifts the block.
+     */
+    private static Boolean safeBootAllowed(Configuration cfg) {
+        if (cfg.getDisableSafeBoot() != null) return !cfg.getDisableSafeBoot();
+        return cfg.isKioskMode() ? Boolean.FALSE : null;
+    }
+
+    private static void putIfManaged(Map<String, Boolean> p, String key, Boolean v) {
+        if (v != null) p.put(key, v);
+    }
+
+    /**
+     * Builds the kiosk block. The main (pinned) app is matched by application VERSION id:
+     * {@code cfg.mainAppId == app.usedVersionId}, never by {@code app.id}.
+     */
+    private static DesiredKiosk kiosk(Configuration cfg, List<Application> apps) {
+        String mainPkg = null;
+        for (Application a : apps) {
+            if (a == null || a.getPkg() == null || a.getPkg().trim().isEmpty()
+                    || a.getAction() != ACTION_INSTALL || !a.getShowIcon()) continue;
+            if (cfg.getMainAppId() != null && cfg.getMainAppId().equals(a.getUsedVersionId())) mainPkg = a.getPkg().trim();
+        }
+        // Dedupe by package name (not row id): another Application row can carry the same pkg as
+        // the main app under a different id, and must not appear twice in allowedPackages or
+        // spuriously flip mode from "single" to "launcher".
+        Set<String> distinctOthers = new TreeSet<String>();
+        for (Application a : apps) {
+            if (a == null || a.getPkg() == null || a.getPkg().trim().isEmpty()
+                    || a.getAction() != ACTION_INSTALL || !a.getShowIcon()) continue;
+            String pkg = a.getPkg().trim();
+            if (mainPkg != null && mainPkg.equals(pkg)) continue;
+            distinctOthers.add(pkg);
+        }
+        List<String> allowed = new ArrayList<String>(distinctOthers);
+        if (mainPkg != null) allowed.add(0, mainPkg);
+
+        DesiredKiosk k = new DesiredKiosk();
+        k.setMode(mainPkg != null && allowed.size() == 1 ? "single" : "launcher");
+        k.setAllowedPackages(allowed);
+        k.setPinPackage(mainPkg);
+        DesiredKioskFeatures f = new DesiredKioskFeatures();
+        // Android refuses Recents or Notifications in kiosk without Home, and the agent's whole kiosk entry fails (older
+        // agents then never enter kiosk). Without Home they are dropped, never Home turned on. Only a true is dropped,
+        // so other configurations keep their revision.
+        boolean home = Boolean.TRUE.equals(cfg.getKioskHome());
+        f.setHome(cfg.getKioskHome());
+        f.setRecents(home || !Boolean.TRUE.equals(cfg.getKioskRecents()) ? cfg.getKioskRecents() : null);
+        f.setNotifications(home || !Boolean.TRUE.equals(cfg.getKioskNotifications()) ? cfg.getKioskNotifications() : null);
+        f.setSystemInfo(cfg.getKioskSystemInfo()); f.setKeyguard(cfg.getKioskKeyguard()); f.setLockButtons(cfg.getKioskLockButtons());
+        // Its own column, not lockButtons: DISALLOW_ADJUST_VOLUME mutes the device, so existing lockButtons=true
+        // kiosks must not start muting on upgrade. Null (all existing rows) is dropped from the canonical JSON.
+        f.setLockVolume(cfg.getKioskLockVolume());
+        k.setFeatures(f);
+        k.setExitMode(Boolean.TRUE.equals(cfg.getKioskExit()) ? "visible" : "gesture");
+        k.setPassword(cfg.getPassword());
+        DesiredKioskTheme t = new DesiredKioskTheme();
+        t.setBackgroundColor(cfg.getBackgroundColor()); t.setTextColor(cfg.getTextColor());
+        t.setIconSize(cfg.getIconSize() == null ? null : cfg.getIconSize().name());
+        k.setTheme(t);
+        return k;
+    }
+
+    /** Recursively sorts map keys and drops null values so nested objects canonicalise too. */
+    private static Object sorted(Object v) {
+        if (v instanceof Map) {
+            TreeMap<String, Object> m = new TreeMap<String, Object>();
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) v).entrySet()) {
+                if (e.getValue() != null) m.put(String.valueOf(e.getKey()), sorted(e.getValue()));
+            }
+            return m;
+        }
+        if (v instanceof List) {
+            List<Object> l = new ArrayList<Object>();
+            for (Object o : (List<?>) v) l.add(sorted(o));
+            return l;
+        }
+        return v;
+    }
+
+    /** Canonical JSON of the document WITHOUT the revision field. */
+    public static String canonicalJson(DesiredConfig doc) {
+        try {
+            Map<?, ?> asMap = PLAIN.convertValue(doc, Map.class);
+            asMap.remove("revision");
+            return PLAIN.writeValueAsString(sorted(asMap));
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot canonicalise desired config", e);
+        }
+    }
+
+    public static String revision(DesiredConfig doc) {
+        try {
+            byte[] h = MessageDigest.getInstance("SHA-256").digest(canonicalJson(doc).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Full JSON (with revision) - the {@code agentCommand.payload} string. */
+    public static String toPayloadJson(DesiredConfig doc) {
+        try { return PLAIN.writeValueAsString(doc); }
+        catch (Exception e) { throw new IllegalStateException(e); }
+    }
+}

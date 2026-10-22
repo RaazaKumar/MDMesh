@@ -16,6 +16,8 @@ export interface DeviceSearchRequest {
   pageNum?: number;
   sortBy?: string;
   sortDir?: 'ASC' | 'DESC';
+  /** Match `value` as the exact device number (or its fast-search suffix) instead of a substring of any field. */
+  fastSearch?: boolean;
 }
 
 /**
@@ -82,7 +84,7 @@ export async function deleteDevicesBulk(ids: number[]): Promise<void> {
 }
 
 /** Rename a device's friendly description — POST /private/devices/{id}/description
- *  (raw text body; requires the edit_device_desc permission, granted to all roles). */
+ *  (raw text body; requires the edit_device_desc permission, which Observer does not have). */
 export async function updateDeviceDescription(
   deviceId: number,
   description: string,

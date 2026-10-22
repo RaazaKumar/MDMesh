@@ -22,6 +22,7 @@
 package com.hmdm.persistence.mapper;
 
 import com.hmdm.persistence.domain.DeviceLocation;
+import com.hmdm.persistence.domain.DeviceSyncRow;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
@@ -83,4 +84,21 @@ public interface AgentDeviceMapper {
             "ORDER BY capturedAt DESC LIMIT #{limit}"})
     List<DeviceLocation> listLocations(@Param("deviceNumber") String deviceNumber,
                                        @Param("since") long since, @Param("limit") int limit);
+
+    @Select({"SELECT number FROM devices WHERE configurationId = #{configurationId}"})
+    List<String> listDeviceNumbersByConfigurationId(@Param("configurationId") int configurationId);
+
+    /**
+     * One row per device of the customer with its configuration + last applied revision (LEFT JOIN: never-reported
+     * devices included), and whether its latest config.apply result has a deferred outcome (one lookup per device on
+     * the agentCommand (deviceNumber, type, id) index).
+     */
+    @Select({"SELECT d.number AS deviceNumber, d.configurationId AS configurationId, d.agentCapabilities AS capabilitiesJson, " +
+            "s.appliedConfigRevision AS appliedConfigRevision, " +
+            "COALESCE((SELECT c.detail LIKE '%\"deferred:%' FROM agentCommand c " +
+            "          WHERE c.deviceNumber = d.number AND c.type = 'config.apply' ORDER BY c.id DESC LIMIT 1), false) " +
+            "AS lastApplyDeferred " +
+            "FROM devices d LEFT JOIN device_state s ON s.deviceNumber = d.number " +
+            "WHERE d.customerId = #{customerId} AND d.configurationId IS NOT NULL"})
+    List<DeviceSyncRow> listDevicesForSync(@Param("customerId") int customerId);
 }

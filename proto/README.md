@@ -27,12 +27,20 @@ This directory is the canonical definition. Implementations mirror it:
 | server → device | **Command envelope** | `command-envelope.schema.json` | when admin acts |
 | device → server | **Command result** | `command-result.schema.json` | after handling a command |
 
+`config.apply` is a fourth, declarative complement to the three imperative commands above: instead of
+telling the device what to do, it carries the whole desired-state document (policies/kiosk/location) plus
+a content-addressed `revision`, and the server re-sends it only when the revision the device last applied
+differs from the one it just computed. See `payloads/config-apply.schema.json` for the command payload and
+`payloads/config-apply-result.schema.json` for the per-key outcome shape in the command result's `detail`.
+
 ## Transport
 
-Commands ride the existing push channels (MQTT topic = device id, or HTTP long-poll) with a
-sync/poll fallback — the agent reconciles on every check-in regardless of push. The matrix
-is posted on the sync/enrollment call. Nothing here assumes push is reliable; push is an
-optimization, the sync loop is the source of truth.
+Commands are delivered in the `/checkin` response (see `endpoints.md`). To get them there quickly,
+the agent holds a WebSocket wake channel, `/agent/ws/{deviceNumber}` (`AgentWakeEndpoint` on the
+server, `TransportManager` in the agent): when a command is queued the server sends a small wake
+signal and the agent checks in. The socket carries no commands. A periodic WorkManager check-in is
+the fallback when it is down. The matrix is posted on the enrollment and check-in calls. Nothing here
+assumes the wake channel is reliable; it is an optimization, the check-in loop is the source of truth.
 
 ## Capability tiers for remote control
 

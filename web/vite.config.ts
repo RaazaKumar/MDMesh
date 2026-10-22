@@ -1,37 +1,42 @@
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// The Headwind server serves its REST API under the `/rest` context. The
-// backend runs on :8090 on the same host, so during development (and when this
-// SPA is served over the LAN) we proxy `/rest` there, sharing the session
-// cookie (JSESSIONID). Override the target with VITE_DEV_PROXY_TARGET.
+// Dev server. Every same-origin path the console calls is proxied to the dev stack's edge (Caddy on :8088, see
+// docker-compose.dev.yml), which routes it exactly as production does: /rest, /files and /agent/ws to the server,
+// /update and /recovery to the supervisor. Override the target with VITE_DEV_PROXY_TARGET.
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'VITE_');
-  const proxyTarget = env.VITE_DEV_PROXY_TARGET || 'http://localhost:8090';
+  const target = env.VITE_DEV_PROXY_TARGET || 'http://localhost:8088';
+  // The server is session-cookie based (JSESSIONID), so cookies must be forwarded. /agent/ws is a WebSocket.
+  const route = (ws = false) => ({ target, changeOrigin: true, cookieDomainRewrite: '', ws });
 
   return {
     plugins: [react()],
+    build: {
+      rolldownOptions: {
+        output: {
+          // Third-party code in its own chunks: the app chunk stays under Vite's 500 kB warning, and a console
+          // upgrade that only changes app code leaves the browser's cached vendor chunks valid.
+          codeSplitting: {
+            groups: [
+              { name: 'react', test: /node_modules[\\/](react|react-dom|react-router|scheduler|cookie|set-cookie-parser)[\\/]/, priority: 2 },
+              { name: 'leaflet', test: /node_modules[\\/]leaflet[\\/]/, priority: 2 },
+              { name: 'vendor', test: /node_modules[\\/]/, priority: 1 },
+            ],
+          },
+        },
+      },
+    },
     server: {
       host: true,
       port: 5173,
       allowedHosts: true,
       proxy: {
-        '/rest': {
-          target: proxyTarget,
-          changeOrigin: true,
-          // The server is session-cookie based, so we must forward cookies.
-          cookieDomainRewrite: '',
-        },
-        // Agent wake channel: the device holds a WebSocket at /agent/ws/{id} for
-        // instant command wake (Sync now, push). Without ws:true the upgrade dies
-        // at the dev server and devices fall back to the 15-min poll floor.
-        // NOTE: keep this prefix exact — a bare '/agent' would also swallow the
-        // /agent.apk download served from public/ and 404 it against Tomcat.
-        '/agent/ws': {
-          target: proxyTarget,
-          changeOrigin: true,
-          ws: true,
-        },
+        '/rest': route(),
+        '/files': route(),
+        '/agent/ws': route(true),
+        '/update': route(),
+        '/recovery': route(),
       },
     },
   };

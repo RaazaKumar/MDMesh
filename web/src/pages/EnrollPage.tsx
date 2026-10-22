@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AppShell } from '../ui/AppShell';
 import { IconCopy } from '../ui/icons';
 import { useToast } from '../ui/toast';
@@ -33,12 +33,18 @@ export function EnrollPage() {
   const [wifiSec, setWifiSec] = useState<WifiSecurity>('WPA');
   const [showPayload, setShowPayload] = useState(false);
   const [configs, setConfigs] = useState<Configuration[]>([]);
+  const [configsState, setConfigsState] = useState<'loading' | 'ok' | 'failed'>('loading');
   const [cfgId, setCfgId] = useState<string>(() => {
     try { return localStorage.getItem(DEFAULT_CONFIG_KEY) ?? ''; } catch { return ''; }
   });
+  const mintSeq = useRef(0);
 
   // Load configurations so the enroller can pull a config's saved provisioning Wi-Fi into the QR.
-  useEffect(() => { getConfigurations().then(setConfigs).catch(() => undefined); }, []);
+  useEffect(() => {
+    getConfigurations()
+      .then((list) => { setConfigs(list); setConfigsState('ok'); })
+      .catch(() => setConfigsState('failed'));
+  }, []);
 
   // When a configuration is selected, fill the Wi-Fi fields from its saved values (still editable).
   useEffect(() => {
@@ -50,11 +56,18 @@ export function EnrollPage() {
     setWifiSec((SECURITY_VALUES as string[]).includes(sec) ? (sec as WifiSecurity) : 'WPA');
   }, [cfgId, configs]);
 
-  async function generate(configurationId?: number) {
+  // Mint a token for configuration `id` ('' = the server's setting). The latest call wins, and the
+  // current code is cleared meanwhile, so the QR never shows a token for another configuration.
+  async function generate(id: string) {
+    const seq = ++mintSeq.current;
+    const n = Number(id);
     setBusy(true);
     setTokError(null);
+    setToken(null);
+    setExpiresAt(undefined);
     try {
-      const res = await mintEnrollToken(configurationId);
+      const res = await mintEnrollToken(Number.isFinite(n) && n > 0 ? n : undefined);
+      if (seq !== mintSeq.current) return;
       if (res.token) {
         setToken(res.token);
         setExpiresAt(res.expiresAt);
@@ -62,22 +75,32 @@ export function EnrollPage() {
         setTokError('The server did not return a token.');
       }
     } catch (err) {
+      if (seq !== mintSeq.current) return;
       if (err instanceof ApiError && err.httpStatus === 0) setTokError('Cannot reach the server.');
       else if (err instanceof ApiError) setTokError(err.message || 'Failed to generate a token.');
       else setTokError('Failed to generate a token.');
     } finally {
-      setBusy(false);
+      if (seq === mintSeq.current) setBusy(false);
     }
   }
 
   // Mint a token whenever the selected configuration changes (including first load): the token
   // BINDS the device to that configuration server-side, so a QR generated for "Kiosk fleet"
-  // must never carry a token minted for a different config.
+  // must never carry a token minted for a different config. Waits for the list, so a stored default
+  // that no longer exists falls back to the server setting instead of minting against a dead id,
+  // and is forgotten so the next visit doesn't fall back again.
   useEffect(() => {
-    const id = Number(cfgId);
-    void generate(Number.isFinite(id) && id > 0 ? id : undefined);
+    if (configsState === 'loading') return;
+    if (cfgId && configsState === 'ok' && !configs.some((c) => String(c.id) === cfgId)) {
+      try {
+        if (localStorage.getItem(DEFAULT_CONFIG_KEY) === cfgId) localStorage.removeItem(DEFAULT_CONFIG_KEY);
+      } catch { /* storage unavailable */ }
+      setCfgId('');
+      return;
+    }
+    void generate(cfgId);
     // eslint-disable-next-line
-  }, [cfgId]);
+  }, [cfgId, configsState]);
 
   async function copy() {
     if (!token) return;
@@ -126,7 +149,7 @@ export function EnrollPage() {
           <section className="panel">
             <div className="panel-head">
               <h2 className="panel-title">Scan to enroll</h2>
-              <button className="btn btn-sm" onClick={() => void generate()} disabled={busy}>
+              <button className="btn btn-sm" onClick={() => void generate(cfgId)} disabled={busy || configsState === 'loading'}>
                 {busy ? 'Generating…' : 'New code'}
               </button>
             </div>
@@ -136,6 +159,11 @@ export function EnrollPage() {
                 <div className="qr-frame">
                   {qrPayload ? (
                     <QrCanvas text={qrPayload} size={320} />
+                  ) : tokError ? (
+                    <div className="empty">
+                      <span className="label">No code</span>
+                      Use New code to try again.
+                    </div>
                   ) : (
                     <div className="empty"><span className="spin" /> Preparing…</div>
                   )}
@@ -235,7 +263,7 @@ export function EnrollPage() {
           <section className="panel enroll-wrap">
             <div className="panel-head">
               <h2 className="panel-title">Enrollment token</h2>
-              <button className="btn btn-primary btn-sm" onClick={() => void generate()} disabled={busy}>
+              <button className="btn btn-primary btn-sm" onClick={() => void generate(cfgId)} disabled={busy || configsState === 'loading'}>
                 {busy ? 'Generating…' : token ? 'Generate another' : 'Generate token'}
               </button>
             </div>

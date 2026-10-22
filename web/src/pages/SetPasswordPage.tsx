@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { useNavigate, Navigate } from 'react-router-dom';
+import { useNavigate, Navigate } from 'react-router';
 import { useAuth } from '../auth/AuthContext';
 import { submitForcedPasswordReset } from '../api/auth';
 import { Wordmark } from '../ui/Wordmark';
@@ -16,10 +16,13 @@ export function SetPasswordPage() {
   const [confirm, setConfirm] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Set while this page signs out after a successful reset: the guard below must not redirect then,
+  // or its state-less <Navigate> replaces ours and the "Password updated" notice is lost.
+  const [leaving, setLeaving] = useState(false);
 
   // Only valid for a flagged session carrying a reset token; otherwise send to login.
   if (!user?.passwordReset || !user.passwordResetToken) {
-    return <Navigate to="/login" replace />;
+    return leaving ? null : <Navigate to="/login" replace />;
   }
   const token = user.passwordResetToken;
 
@@ -37,6 +40,7 @@ export function SetPasswordPage() {
     setBusy(true);
     try {
       await submitForcedPasswordReset(token, pw);
+      setLeaving(true);
       await signOut(); // clear the flagged session; require a fresh login with the new password
       navigate('/login', { replace: true, state: { passwordChanged: true } });
     } catch {

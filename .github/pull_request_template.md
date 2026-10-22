@@ -6,6 +6,11 @@
 
 Closes #
 
+## Changelog
+
+<!-- The line this adds under Unreleased in CHANGELOG.md, written for operators, and its section
+     (Upgrading, Heads-up, New, Fixes, Under the hood). Or "none". -->
+
 ## Type of change
 
 - [ ] 🐞 Bug fix
@@ -23,7 +28,7 @@ Closes #
 
 ## How it was tested
 
-<!-- Commands you ran + results. e.g. `mvn -pl common test`, `npx tsc --noEmit`,
+<!-- Commands you ran + results. e.g. `mvn -pl common test`, `npx tsc -b --noEmit`,
      `./gradlew :app:compileDebugKotlin`, `node --test`, manual steps. -->
 
 ## Checklist

@@ -53,6 +53,7 @@ public class AgentV1ContractTest {
         AgentCheckInRequest r = load("checkin-future.json", AgentCheckInRequest.class);
         assertEquals("dev-1", r.getDeviceId());
         assertEquals("14", r.getState().getAndroidRelease());
+        assertEquals("0123abcd", r.getState().getAppliedConfigRevision());
     }
 
     /** Response fields the agent parses must keep their names. */
@@ -66,6 +67,13 @@ public class AgentV1ContractTest {
         assertTrue(json.contains("\"type\""));
         assertTrue(json.contains("device.lock"));
         assertTrue(json.contains("\"commands\""));
+    }
+
+    /** The agent requires a sha256 on app.install only when the check-in says the server guarantees one. */
+    @Test
+    public void checkin_response_announces_install_integrity() throws Exception {
+        String json = mapper.writeValueAsString(new AgentCheckInResponse(Collections.emptyList()));
+        assertTrue(json, json.contains("\"installIntegrity\":\"required\""));
     }
 
     @Test

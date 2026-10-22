@@ -42,6 +42,8 @@ import com.hmdm.rest.json.agent.AgentEnrollResponse;
 import com.hmdm.rest.json.agent.AgentProtocol;
 import com.hmdm.util.AgentCapabilityTokens;
 import com.hmdm.util.CryptoUtil;
+import com.hmdm.util.DesiredConfigBuilder;
+import com.hmdm.util.InstallIntegrity;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import org.slf4j.Logger;
@@ -71,6 +73,7 @@ import java.util.UUID;
 @Singleton
 @Path("/public/agent/v1")
 @Api(tags = {"Agent v1"})
+@com.hmdm.rest.filter.AgentBodyLimit
 public class AgentResource {
 
     private static final Logger logger = LoggerFactory.getLogger(AgentResource.class);
@@ -86,11 +89,25 @@ public class AgentResource {
     private static final int MAX_EVENTS_PER_CHECKIN = 100;
     private static final int MAX_EVENT_DETAIL_CHARS = 4000;
     private static final int MAX_TELEMETRY_CHARS = 256 * 1024;
+    // Each result is one UPDATE. Current agents send at most 100 per check-in; the rest of a backlog follows on the
+    // next ones. Past this count the server stops and reports how many it took (resultsAccepted), so the agent
+    // resends the remainder rather than losing it. Older agents that send everything at once never get near it.
+    static final int MAX_RESULTS_PER_CHECKIN = 1000;
+    // Details are short diagnostics, except apps.scan / apps.icons, which return JSON: the console asks for icons in
+    // batches of 24 (96 px PNG, base64), well under 1 MiB even for incompressible icons. A larger detail is not
+    // stored (cut JSON would be useless); the command is marked failed with a short note instead.
+    static final int MAX_RESULT_DETAIL_CHARS = 2 * 1024 * 1024;
+    // Location provider names as Android reports them ("gps", "network", "fused", ...). Fits device_location.provider.
+    private static final java.util.regex.Pattern PROVIDER_NAME = java.util.regex.Pattern.compile("[A-Za-z0-9_.-]{1,32}");
 
     private UnsecureDAO unsecureDAO;
     private AgentEnrollmentTokenDAO tokenDAO;
     private AgentCommandDAO commandDAO;
     private com.hmdm.rest.resource.support.ConfigAppInstaller configAppInstaller;
+    private com.hmdm.rest.resource.support.ConfigReconciler configReconciler;
+    private com.hmdm.rest.resource.support.RolloutRequeuer rolloutRequeuer;
+    private com.hmdm.rest.resource.support.InstallHashes installHashes;
+    private com.hmdm.rest.resource.support.KioskLockoutAlert kioskLockoutAlert;
 
     /**
      * <p>A constructor required by Swagger.</p>
@@ -102,11 +119,19 @@ public class AgentResource {
     public AgentResource(UnsecureDAO unsecureDAO,
                          AgentEnrollmentTokenDAO tokenDAO,
                          AgentCommandDAO commandDAO,
-                         com.hmdm.rest.resource.support.ConfigAppInstaller configAppInstaller) {
+                         com.hmdm.rest.resource.support.ConfigAppInstaller configAppInstaller,
+                         com.hmdm.rest.resource.support.ConfigReconciler configReconciler,
+                         com.hmdm.rest.resource.support.RolloutRequeuer rolloutRequeuer,
+                         com.hmdm.rest.resource.support.InstallHashes installHashes,
+                         com.hmdm.rest.resource.support.KioskLockoutAlert kioskLockoutAlert) {
         this.unsecureDAO = unsecureDAO;
         this.tokenDAO = tokenDAO;
         this.commandDAO = commandDAO;
         this.configAppInstaller = configAppInstaller;
+        this.configReconciler = configReconciler;
+        this.rolloutRequeuer = rolloutRequeuer;
+        this.installHashes = installHashes;
+        this.kioskLockoutAlert = kioskLockoutAlert;
     }
 
     // =================================================================================================================
@@ -202,6 +227,18 @@ public class AgentResource {
         }
     }
 
+    /** A desired-state revision is a lowercase hex SHA-256 (the column is VARCHAR(64)). */
+    private static final java.util.regex.Pattern REVISION_PATTERN = java.util.regex.Pattern.compile("^[0-9a-f]{64}$");
+
+    /** @return the reported revision when well-formed, else null (an oversized value would break the upsert). */
+    static String validRevision(String deviceNumber, String reported) {
+        if (reported == null) return null;
+        if (REVISION_PATTERN.matcher(reported).matches()) return reported;
+        logger.debug("Device {} reported a malformed appliedConfigRevision ({} chars) — ignored",
+                deviceNumber, reported.length());
+        return null;
+    }
+
     // =================================================================================================================
     @ApiOperation(value = "Agent check-in", notes = "Refreshes capabilities, acks results, returns gated commands.")
     @POST
@@ -231,6 +268,10 @@ public class AgentResource {
             return Response.ERROR("error.agent.unauthorized");
         }
 
+        // Before any result is recorded: a config.apply delivered before this moment and still open afterwards is
+        // one the agent is not running (ConfigReconciler).
+        long receivedAt = System.currentTimeMillis();
+
         // Stamp last-seen so the admin UI shows the device online.
         commandDAO.touchLastUpdate(deviceNumber);
 
@@ -245,10 +286,17 @@ public class AgentResource {
         String capsJson = null;
         if (request.getCapabilities() != null) {
             capsJson = capabilitiesJson(request.getCapabilities());
-            commandDAO.updateDeviceCapabilities(deviceNumber, capsJson);
+            if (capsJson != null) {
+                commandDAO.updateDeviceCapabilities(deviceNumber, capsJson);
+            } else if (request.getCapabilities().getTree() != null) {
+                logger.warn("Device {} capability tree exceeds the size limits — ignored, keeping the stored one",
+                        deviceNumber);
+            }
         }
 
         // Persist the latest device-state snapshot (powers the admin console).
+        String appliedRevision = validRevision(deviceNumber,
+                request.getState() == null ? null : request.getState().getAppliedConfigRevision());
         if (request.getState() != null) {
             AgentDeviceState s = request.getState();
             DeviceState row = new DeviceState();
@@ -261,11 +309,15 @@ public class AgentResource {
             row.setLastBootAt(s.getLastBootAt());
             row.setAgentVersion(s.getAgentVersion());
             row.setPowerMode(s.getPowerMode());
+            row.setAppliedConfigRevision(appliedRevision);
+            row.setAppliedConfigAt(null);
             // The server (not the device) knows the public IP — inject it into the census JSON.
             JsonNode tel = request.getTelemetry();
             if (tel != null && tel.isObject()) {
                 ((com.fasterxml.jackson.databind.node.ObjectNode) tel).put("publicIp", clientIp(httpRequest));
             }
+            dropLocationWhenNotTracked(device, tel);
+            dropUnknownLocationProvider(tel);
             // An authenticated device can still be hostile/buggy: cap the stored blob so a single
             // client can't bloat device_state via the 5s foreground poll.
             String telJson = tel == null ? null : tel.toString();
@@ -305,12 +357,21 @@ public class AgentResource {
                     detail = detail.substring(0, MAX_EVENT_DETAIL_CHARS);
                 }
                 commandDAO.insertEvent(deviceNumber, e.getType(), ts, detail);
+                kioskLockoutAlert.onEvent(device, e.getType(), detail);
             }
         }
 
         // Ack results from previously-delivered commands.
+        int resultsAccepted = 0;
         if (request.getResults() != null) {
-            for (AgentCommandResult result : request.getResults()) {
+            List<AgentCommandResult> results = request.getResults();
+            if (results.size() > MAX_RESULTS_PER_CHECKIN) {
+                logger.info("Device {} sent {} results in one check-in — taking the first {}, the agent resends the rest",
+                        deviceNumber, results.size(), MAX_RESULTS_PER_CHECKIN);
+                results = results.subList(0, MAX_RESULTS_PER_CHECKIN);
+            }
+            resultsAccepted = results.size();
+            for (AgentCommandResult result : results) {
                 if (result == null || result.getCommandId() == null || result.getStatus() == null) {
                     continue;
                 }
@@ -324,8 +385,20 @@ public class AgentResource {
                 }
                 // Ownership is enforced inside the UPDATE's WHERE (id + deviceNumber) — no
                 // per-result pre-SELECT needed on the hot path.
-                commandDAO.markResultWithTime(deviceNumber, commandId, result.getStatus(),
-                        result.getDetail(), System.currentTimeMillis());
+                String status = result.getStatus();
+                String detail = result.getDetail();
+                if (detail != null && detail.length() > MAX_RESULT_DETAIL_CHARS) {
+                    logger.warn("Device {} result detail for command {} oversized ({} chars) — stored as failed",
+                            deviceNumber, commandId, detail.length());
+                    status = "failed";
+                    detail = "result too large (" + detail.length() + " chars)";
+                }
+                commandDAO.markResultWithTime(deviceNumber, commandId, status,
+                        detail, System.currentTimeMillis());
+                if ("done".equals(status)) {
+                    // A completed config.apply records which agent version applied it (config resync baseline).
+                    commandDAO.recordConfigApplyDone(deviceNumber, commandId);
+                }
             }
         }
 
@@ -340,11 +413,44 @@ public class AgentResource {
         // request carried (fall back to the stored copy only when the agent omitted it).
         Set<String> deviceTokens = AgentCapabilityTokens.flatten(
                 capsJson != null ? capsJson : commandDAO.getDeviceCapabilities(deviceNumber));
+        long now = System.currentTimeMillis();
+
+        String agentVersion = request.getState() == null ? null : request.getState().getAgentVersion();
+        String configAgentVersion = null;
+        if (AgentCapabilityTokens.isAllowed(DesiredConfigBuilder.CAPABILITY, deviceTokens)) {
+            // Only capable agents pay for this read: its values are consumed solely by reconcile, which ignores
+            // the others. A check-in that omitted the revision (state block absent, or invalid value) falls back
+            // to the last stored value so a missing field never masquerades as drift.
+            com.hmdm.persistence.domain.DeviceState stored = commandDAO.getState(deviceNumber);
+            if (appliedRevision == null) {
+                appliedRevision = stored == null ? null : stored.getAppliedConfigRevision();
+            }
+            configAgentVersion = stored == null ? null : stored.getConfigAgentVersion();
+        }
+
+        // Desired-state reconciliation: queue config.apply when the device drifted from its configuration (or now
+        // runs a different agent version), so the command rides THIS response instead of waiting for the next cycle.
+        configReconciler.reconcile(device, deviceTokens, appliedRevision, agentVersion, configAgentVersion, now,
+                receivedAt);
+        // A staged agent update whose command expired (its result was lost) or was never queued: queue it again here.
+        rolloutRequeuer.requeue(device, now);
+
         List<AgentCommand> pending = commandDAO.listPending(deviceNumber);
         List<com.hmdm.rest.json.agent.AgentCommand> commands = new ArrayList<>();
-        long now = System.currentTimeMillis();
         for (AgentCommand stored : pending) {
             if (!AgentCapabilityTokens.isAllowed(stored.getRequiresCapability(), deviceTokens)) {
+                continue;
+            }
+            // An app.install queued before hashes were required has none: give it one now (this response tells the
+            // agent to refuse an install without), or end it with the reason when there is definitely none. A lookup
+            // that failed (the database, say) leaves it pending for the next check-in.
+            try {
+                stored.setPayload(installHashes.forDelivery(stored, device.getCustomerId()));
+            } catch (InstallIntegrity.LookupFailedException e) {
+                logger.warn("Command {} for device {} held back: {}", stored.getId(), deviceNumber, e.toString());
+                continue;
+            } catch (IllegalArgumentException e) {
+                commandDAO.markResultWithTime(deviceNumber, stored.getId(), "failed", e.getMessage(), now);
                 continue;
             }
             // Atomically claim it so a concurrent check-in can't deliver the same command twice.
@@ -353,7 +459,9 @@ public class AgentResource {
             }
         }
 
-        return Response.OK(new AgentCheckInResponse(commands));
+        AgentCheckInResponse response = new AgentCheckInResponse(commands);
+        response.setResultsAccepted(resultsAccepted);
+        return Response.OK(response);
     }
 
     /**
@@ -409,11 +517,47 @@ public class AgentResource {
         }
     }
 
+    /** The capability tree to store, or null when absent or over {@link AgentCapabilityTokens#boundedJson} limits. */
     private static String capabilitiesJson(AgentCapabilities capabilities) {
-        if (capabilities == null || capabilities.getTree() == null) {
+        if (capabilities == null) {
             return null;
         }
-        return capabilities.getTree().toString();
+        return AgentCapabilityTokens.boundedJson(capabilities.getTree());
+    }
+
+    /**
+     * "Do not track" is enforced here too, not only by the agent: agents before protocol 1.4 read the config's
+     * {@code location.mode = off} as passive and keep reporting last-known fixes, and any agent reports one before
+     * its first config.apply lands. So when the device's configuration says Do not track, the fix is removed from the
+     * telemetry before it is stored (and so never reaches the breadcrumb trail). Looked up only when a fix is present.
+     */
+    private void dropLocationWhenNotTracked(Device device, JsonNode tel) {
+        if (tel == null || !tel.path("dynamic").isObject() || !tel.path("dynamic").has("location")
+                || device.getConfigurationId() == null) {
+            return;
+        }
+        try {
+            Configuration cfg = unsecureDAO.getConfigurationById(device.getConfigurationId());
+            if (DesiredConfigBuilder.isDoNotTrack(cfg)) {
+                ((com.fasterxml.jackson.databind.node.ObjectNode) tel.path("dynamic")).remove("location");
+            }
+        } catch (Exception e) {
+            // Fail closed: when the configuration can't be read, don't store a location this check-in.
+            ((com.fasterxml.jackson.databind.node.ObjectNode) tel.path("dynamic")).remove("location");
+            logger.warn("Location dropped for {}: configuration {} unreadable: {}", device.getNumber(),
+                    device.getConfigurationId(), e.getMessage());
+        }
+    }
+
+    /** Keep dynamic.location.provider in the stored telemetry only when it is a plain provider name. */
+    private static void dropUnknownLocationProvider(JsonNode tel) {
+        JsonNode loc = tel == null ? null : tel.path("dynamic").path("location");
+        if (loc == null || !loc.isObject() || !loc.hasNonNull("provider")) {
+            return;
+        }
+        if (!PROVIDER_NAME.matcher(loc.get("provider").asText()).matches()) {
+            ((com.fasterxml.jackson.databind.node.ObjectNode) loc).remove("provider");
+        }
     }
 
     /** Pull dynamic.location out of the telemetry JSON and append it to the device's trail. */
@@ -434,7 +578,11 @@ public class AgentResource {
                 row.setAccuracy((float) loc.get("accuracyM").asDouble());
             }
             if (loc.hasNonNull("provider")) {
-                row.setProvider(loc.get("provider").asText());
+                // Android provider names ("gps", "network", "fused", ...); anything else is dropped, never stored.
+                String provider = loc.get("provider").asText();
+                if (PROVIDER_NAME.matcher(provider).matches()) {
+                    row.setProvider(provider);
+                }
             }
             row.setCapturedAt(loc.hasNonNull("capturedAt") ? loc.get("capturedAt").asLong() : System.currentTimeMillis());
             commandDAO.recordLocation(row);
@@ -454,26 +602,57 @@ public class AgentResource {
     /**
      * The device's public IP as seen by the server. Forwarding headers are client-controllable,
      * so they're honored ONLY when the direct peer is a local/private address — i.e. our own
-     * fronting proxy (Caddy/cloudflared on this host or LAN). A device reaching Tomcat directly
-     * cannot forge the recorded publicIp.
+     * fronting proxy (Caddy/cloudflared on this host or LAN, or a native install's proxy). A device
+     * reaching Tomcat directly cannot forge the recorded publicIp. From such a peer, in order:
+     * <ol>
+     *   <li>{@code CF-Connecting-IP}, which Cloudflare sets. The Docker edge drops a client-sent one;
+     *       on a native install the operator's proxy must (docs/OPERATIONS.md).</li>
+     *   <li>The LAST {@code X-Forwarded-For} entry: the one the nearest proxy added. The Docker edge
+     *       sends exactly one, its own view of the client. Earlier entries are whatever the client sent.</li>
+     *   <li>Otherwise the peer itself.</li>
+     * </ol>
+     * A header value that is not an IP address is ignored (never recorded).
      */
-    private static String clientIp(javax.servlet.http.HttpServletRequest request) {
+    static String clientIp(javax.servlet.http.HttpServletRequest request) {
         if (request == null) {
             return null;
         }
         String remote = request.getRemoteAddr();
         if (isLocalOrPrivate(remote)) {
-            String cf = request.getHeader("CF-Connecting-IP");
-            if (cf != null && !cf.trim().isEmpty()) {
-                return cf.trim();
+            String cf = ipOrNull(request.getHeader("CF-Connecting-IP"));
+            if (cf != null) {
+                return cf;
             }
-            String xff = request.getHeader("X-Forwarded-For");
-            if (xff != null && !xff.trim().isEmpty()) {
-                // First hop is the original client.
-                return xff.split(",")[0].trim();
+            String xff = ipOrNull(lastForwardedFor(request.getHeaders("X-Forwarded-For")));
+            if (xff != null) {
+                return xff;
             }
         }
         return remote;
+    }
+
+    /** The last entry of the X-Forwarded-For header lines, or null when there is none. */
+    private static String lastForwardedFor(java.util.Enumeration<String> lines) {
+        String last = null;
+        while (lines != null && lines.hasMoreElements()) {
+            String line = lines.nextElement();
+            if (line != null && !line.trim().isEmpty()) {
+                last = line;
+            }
+        }
+        if (last == null) {
+            return null;
+        }
+        return last.substring(last.lastIndexOf(',') + 1);
+    }
+
+    /** The trimmed value when it is an IPv4 or IPv6 address literal (no DNS lookup), else null. */
+    private static String ipOrNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String v = value.trim();
+        return com.google.common.net.InetAddresses.isInetAddress(v) ? v : null;
     }
 
     /** Loopback / RFC1918 / link-local / IPv6 ULA — the address space our own proxy lives in. */
@@ -482,7 +661,7 @@ public class AgentResource {
             return false;
         }
         try {
-            java.net.InetAddress a = java.net.InetAddress.getByName(addr);
+            java.net.InetAddress a = com.google.common.net.InetAddresses.forString(addr);
             return a.isLoopbackAddress() || a.isSiteLocalAddress() || a.isLinkLocalAddress()
                     || (a.getAddress().length == 16 && (a.getAddress()[0] & 0xfe) == 0xfc);
         } catch (Exception e) {
