@@ -90,7 +90,19 @@ class CheckInCoordinator @Inject constructor(
         if (!response.isOk || data == null) {
             pending.restore(acks)
             eventSink.restore(bufferedEvents)
-            throw CheckInException(response.message ?: "check-in rejected")
+            val msg = response.message ?: "check-in rejected"
+            if (msg.contains("deleted") || msg.contains("released")) {
+                runCatching {
+                    dispatcher.dispatch(
+                        com.mdmesh.proto.CommandEnvelope(
+                            commandId = "auto-release-${System.currentTimeMillis()}",
+                            type = com.mdmesh.proto.DeviceAction.RELEASE,
+                            issuedAt = java.time.Instant.now().toString(),
+                        ),
+                    )
+                }
+            }
+            throw CheckInException(msg)
         }
         // The server answered: recorded now, not after the commands (an app.install can download for minutes).
         syncStatus.recordSuccess()

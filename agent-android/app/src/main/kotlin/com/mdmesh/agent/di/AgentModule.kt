@@ -29,6 +29,8 @@ import com.mdmesh.core.command.handlers.DeviceLocationModeHandler
 import com.mdmesh.core.command.handlers.DevicePowerModeHandler
 import com.mdmesh.core.command.handlers.DeviceRingStopHandler
 import com.mdmesh.core.command.handlers.DeviceWipeHandler
+import com.mdmesh.core.command.handlers.DeviceReleaseHandler
+import com.mdmesh.core.store.DeviceIdStore
 import com.mdmesh.core.config.ConfigApplier
 import com.mdmesh.core.location.LocationModeStore
 import com.mdmesh.core.power.PowerModeStore
@@ -321,6 +323,15 @@ object AgentModule {
     @IntoSet
     fun provideWipeHandler(handle: DpmHandle): CommandHandler =
         DeviceWipeHandler(handle)
+
+    @Provides
+    @IntoSet
+    fun provideReleaseHandler(
+        @ApplicationContext context: Context,
+        handle: DpmHandle,
+        deviceIdStore: DeviceIdStore,
+    ): CommandHandler =
+        DeviceReleaseHandler(context, handle, deviceIdStore)
 
     @Provides
     @IntoSet

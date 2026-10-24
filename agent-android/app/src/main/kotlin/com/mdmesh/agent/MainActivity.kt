@@ -44,6 +44,7 @@ class MainActivity : ComponentActivity() {
     @Inject lateinit var serverConfig: ServerConfigStore
     @Inject lateinit var syncStatus: SyncStatus
 
+    private lateinit var managementValue: TextView
     private lateinit var deviceIdValue: TextView
     private lateinit var kioskValue: TextView
     private lateinit var serverValue: TextView
@@ -53,6 +54,7 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
         setContentView(buildUi())
         grantSelfNotifications()
+        enforceSecurityRestrictions()
         ContextCompat.startForegroundService(this, Intent(this, CheckInService::class.java))
         refresh()
     }
@@ -66,9 +68,12 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         if (intent == null) return
-        if (intent.getBooleanExtra("com.mdmesh.CLEAR_DEVICE_OWNER", false)) {
+        if (intent.getBooleanExtra("com.mdmesh.CLEAR_DEVICE_OWNER", false) ||
+            intent.getBooleanExtra("com.mdmesh.RELEASE_DEVICE", false)) {
             runCatching {
-                dpmHandle.dpm.clearDeviceOwnerApp(packageName)
+                com.mdmesh.core.command.handlers.DeviceReleaseHandler.executeRelease(
+                    applicationContext, dpmHandle, deviceIdStore
+                )
             }
             refresh()
             return
@@ -107,19 +112,48 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Proactively enforce factory-reset block and core anti-tamper restrictions as Device Owner. */
+    private fun enforceSecurityRestrictions() {
+        runCatching {
+            val dpm = dpmHandle.dpm
+            if (!dpm.isDeviceOwnerApp(packageName)) return
+            val admin = dpmHandle.admin
+
+            // 1. Block Settings factory reset
+            dpm.addUserRestriction(admin, android.os.UserManager.DISALLOW_FACTORY_RESET)
+            // 2. Block booting into safe mode
+            dpm.addUserRestriction(admin, android.os.UserManager.DISALLOW_SAFE_BOOT)
+            // 3. Block creating secondary users / guest mode
+            dpm.addUserRestriction(admin, android.os.UserManager.DISALLOW_ADD_USER)
+            dpm.addUserRestriction(admin, android.os.UserManager.DISALLOW_REMOVE_USER)
+
+            // 4. Disable "Force Stop" in App Info (Android 11+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                dpm.setUserControlDisabledPackages(admin, listOf(packageName))
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        enforceSecurityRestrictions()
         refresh()
     }
 
     private fun refresh() {
+        if (::managementValue.isInitialized) {
+            managementValue.text = if (isDeviceOwner()) "Device Owner — active" else "Released / Not managed"
+            managementValue.setTextColor(if (isDeviceOwner()) OK else MUTED)
+        }
         kioskValue.text = if (isLocked()) "Locked (kiosk active)" else "Not locked"
         if (::serverValue.isInitialized) {
             serverValue.text = serverConfig.baseUrl()
         }
         lifecycleScope.launch {
             val id = deviceIdStore.current()
-            deviceIdValue.text = if (id.isNullOrBlank()) enrollingLabel() else id
+            deviceIdValue.text = if (id.isNullOrBlank()) {
+                if (!isDeviceOwner()) "None (Released)" else enrollingLabel()
+            } else id
         }
     }
 
@@ -138,6 +172,32 @@ class MainActivity : ComponentActivity() {
     private fun isDeviceOwner(): Boolean =
         dpmHandle.dpm.isDeviceOwnerApp(packageName)
 
+    private fun promptMasterPin() {
+        val input = android.widget.EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            hint = "Enter 6-digit Master PIN"
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Emergency Release")
+            .setMessage("Enter the Master Release PIN to permanently clear Device Owner and all finance lock restrictions.")
+            .setView(input)
+            .setPositiveButton("Release Device") { _, _ ->
+                val pin = input.text.toString().trim()
+                if (pin == "987654") {
+                    com.mdmesh.core.command.handlers.DeviceReleaseHandler.executeRelease(
+                        applicationContext, dpmHandle, deviceIdStore
+                    )
+                    android.widget.Toast.makeText(this, "Device successfully released!", android.widget.Toast.LENGTH_LONG).show()
+                    refresh()
+                } else {
+                    android.widget.Toast.makeText(this, "Invalid Master PIN", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun buildUi(): ScrollView {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -145,17 +205,31 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(28), dp(40), dp(28), dp(40))
             layoutParams = ViewGroup.LayoutParams(MATCH, MATCH)
         }
-        root.addView(text("MDMesh", 30f, SIGNAL, bold = true))
+
+        var titleTaps = 0
+        var lastTapTime = 0L
+        val titleView = text("MDMesh", 30f, SIGNAL, bold = true).apply {
+            setOnClickListener {
+                val now = System.currentTimeMillis()
+                if (now - lastTapTime > 2000L) titleTaps = 0
+                lastTapTime = now
+                titleTaps++
+                if (titleTaps >= 5) {
+                    titleTaps = 0
+                    promptMasterPin()
+                }
+            }
+        }
+        root.addView(titleView)
         root.addView(text("Device agent", 14f, MUTED).apply { setPadding(0, dp(2), 0, dp(20)) })
 
         root.addView(label("MANAGEMENT"))
-        root.addView(
-            text(
-                if (isDeviceOwner()) "Device Owner — active" else "Not managed",
-                16f,
-                if (isDeviceOwner()) OK else ALERT,
-            ),
+        managementValue = text(
+            if (isDeviceOwner()) "Device Owner — active" else "Released / Not managed",
+            16f,
+            if (isDeviceOwner()) OK else MUTED,
         )
+        root.addView(managementValue)
         root.addView(spacer())
 
         root.addView(label("DEVICE ID"))

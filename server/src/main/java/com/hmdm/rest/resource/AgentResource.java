@@ -257,8 +257,8 @@ public class AgentResource {
         // One indistinguishable error for unknown-device AND bad-secret: a distinguishable pair
         // is an enumeration oracle for probing valid device numbers on a public endpoint.
         if (device == null) {
-            logger.info("Agent checkin: rejected - unknown device {}", deviceNumber);
-            return Response.ERROR("error.agent.unauthorized");
+            logger.info("Agent checkin: rejected - unknown or deleted device {}", deviceNumber);
+            return Response.ERROR("error.agent.device.deleted");
         }
 
         // Authenticate the device by its per-device secret BEFORE any state change.

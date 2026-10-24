@@ -195,6 +195,12 @@ export const ACTION_TEMPLATES: CommandTemplateExt[] = [
     request: { type: 'device.wipe', requiresCapability: 'device.wipe' },
   },
   {
+    key: 'release', label: 'Release device (Loan Complete)', group: 'destructive', danger: true,
+    description: 'Permanently remove all MDM restrictions, clear Device Owner, and unlock device for the customer.',
+    confirm: 'type-to-confirm',
+    request: { type: 'device.release', requiresCapability: 'device.release' },
+  },
+  {
     key: 'power-adaptive', label: 'Connectivity: Battery-saver', group: 'safe',
     description: 'Hold the live connection only when the screen is on or charging; use the low-power heartbeat when idle. Battery-friendly default.',
     request: {

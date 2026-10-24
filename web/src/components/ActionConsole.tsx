@@ -91,7 +91,7 @@ export function ActionConsole({ device }: { device: Device }) {
 
   const canSend =
     !active ? false
-    : active.confirm === 'type-to-confirm' ? confirmText === 'WIPE'
+    : active.confirm === 'type-to-confirm' ? (active.key === 'release' ? confirmText === 'RELEASE' : confirmText === 'WIPE')
     : active.params?.some((p) => p.required && !values[p.key]) ? false
     : true;
 
@@ -162,7 +162,7 @@ export function ActionConsole({ device }: { device: Device }) {
             ))}
             {active.confirm === 'type-to-confirm' && (
               <label className="field">
-                <span>Type <strong>WIPE</strong> to confirm</span>
+                <span>Type <strong>{active.key === 'release' ? 'RELEASE' : 'WIPE'}</strong> to confirm</span>
                 <input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} />
               </label>
             )}

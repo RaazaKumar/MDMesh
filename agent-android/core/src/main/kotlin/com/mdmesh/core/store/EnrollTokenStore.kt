@@ -44,6 +44,10 @@ class EnrollTokenStore(private val context: Context) : EnrollTokenProvider {
         context.enrollTokenDataStore.edit { it[KEY_TOKEN] = token }
     }
 
+    suspend fun clear() {
+        context.enrollTokenDataStore.edit { it.remove(KEY_TOKEN) }
+    }
+
     private companion object {
         val KEY_TOKEN = stringPreferencesKey("enroll_token")
     }
